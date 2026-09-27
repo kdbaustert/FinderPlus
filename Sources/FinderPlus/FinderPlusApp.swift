@@ -47,6 +47,8 @@ private struct SearchWindow: View {
                 if appearsActive { appDelegate.model = model }
             }
             .onDisappear {
+                // A closed window's search would otherwise go on walking the disk unseen.
+                model.stop()
                 if appDelegate.model === model { appDelegate.model = nil }
             }
     }
@@ -54,6 +56,16 @@ private struct SearchWindow: View {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// How the Shortcuts action reaches this object. `NSApp.delegate` can't: under
+    /// `@NSApplicationDelegateAdaptor` it is SwiftUI's own forwarding delegate, not this class.
+    /// Set in `init`, which the adaptor runs at launch, before any intent can be performed.
+    static private(set) weak var shared: AppDelegate?
+
+    override init() {
+        super.init()
+        Self.shared = self
+    }
+
     /// The model of the active window. Folders and searches that arrive before a window exists
     /// wait in the `pending` fields below.
     var model: SearchModel? {

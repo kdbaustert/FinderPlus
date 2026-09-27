@@ -97,7 +97,8 @@ enum SizeFilter: String, CaseIterable, Identifiable, Codable, Sendable {
         switch self {
         case .any: return true
         case .under1MB: return size >= 0 && size < megabyte
-        case .over1MB: return size > megabyte
+        // At least, so Under and Over 1 MB between them take every file: exactly 1 MB fell in neither.
+        case .over1MB: return size >= megabyte
         case .over100MB: return size > 100 * megabyte
         case .over1GB: return size > 1_000 * megabyte
         }

@@ -50,9 +50,13 @@ struct FindFilesIntent: AppIntent {
         options.includeHidden = includeHidden
         // A query with a wildcard in it means the pattern, not files named "*".
         if query.contains("*") || query.contains("?") { options.mode = .wildcards }
-        let hits = try await IntentSearch.hits(
-            query: query, root: folder?.fileURL ?? FileManager.default.homeDirectoryForCurrentUser,
-            options: options, limit: limit)
+        // A folder that was given but can't be reached is an error, not a reason to search home.
+        var root = FileManager.default.homeDirectoryForCurrentUser
+        if let folder {
+            guard let url = folder.fileURL else { throw IntentMessage("That folder isn’t available.") }
+            root = url
+        }
+        let hits = try await IntentSearch.hits(query: query, root: root, options: options, limit: limit)
         return .result(value: hits.map { IntentFile(fileURL: $0.url) })
     }
 }
@@ -86,12 +90,26 @@ struct FindDuplicateFilesIntent: AppIntent {
         let hits = try await IntentSearch.hits(query: "*", root: root, options: options, limit: 0)
         let candidates = hits.filter { !$0.isFolder && !$0.isArchiveEntry && $0.size > 0 }
             .map { DuplicateFinder.Candidate(id: $0.id, url: $0.url, size: $0.size) }
-        let sets = await Task.detached { DuplicateFinder.sets(in: candidates) }.value
+        // A detached task isn't cancelled with the shortcut, so cancellation is passed on by hand —
+        // otherwise hashing a large folder carries on after the user has stopped it.
+        let hashing = Task.detached { DuplicateFinder.sets(in: candidates) }
+        let sets = await withTaskCancellationHandler {
+            await hashing.value
+        } onCancel: {
+            hashing.cancel()
+        }
+        // Sets cut short by cancellation are incomplete; don't hand them to a Move to Trash.
+        try Task.checkCancellation()
         let byID = Dictionary(uniqueKeysWithValues: hits.map { ($0.id, $0) })
         var extras: [URL] = []
         for set in sets {
+            // Finder copies keep the modification date, so ties are common, and on path alone
+            // "Report copy.pdf" sorts before "Report.pdf" and the original would be the extra.
             let files = set.compactMap { byID[$0] }
-                .sorted { ($0.modified, $0.url.path) < ($1.modified, $1.url.path) }
+                .sorted {
+                    ($0.modified, $0.created, $0.name.count, $0.url.path)
+                        < ($1.modified, $1.created, $1.name.count, $1.url.path)
+                }
             extras += files.dropFirst().map(\.url)
         }
         return .result(value: extras.map { IntentFile(fileURL: $0) })
@@ -122,7 +140,17 @@ struct SearchInFinderPlusIntent: AppIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult {
-        (NSApp.delegate as? AppDelegate)?.searchFromIntent(query: query, folder: folder?.fileURL)
+        guard let delegate = AppDelegate.shared else {
+            throw IntentMessage("FinderPlus couldn’t start the search. Open it and try again.")
+        }
+        // A folder that was given but can't be reached is an error, not a reason to search the
+        // window's current location.
+        var root: URL?
+        if let folder {
+            guard let url = folder.fileURL else { throw IntentMessage("That folder isn’t available.") }
+            root = url
+        }
+        delegate.searchFromIntent(query: query, folder: root)
         return .result()
     }
 }

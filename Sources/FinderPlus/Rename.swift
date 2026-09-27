@@ -58,7 +58,7 @@ enum BatchRename {
     }
 
     /// Everything the sheet's fields choose. `newName` applies whichever rule `action` picks.
-    struct Recipe {
+    struct Recipe: Equatable {
         var action: Action = .replaceText
         var find = ""
         var replacement = ""
@@ -69,10 +69,11 @@ enum BatchRename {
         var datePosition: DatePosition = .before
 
         /// `index` is the row's position in the batch, for numbering. The extension stays put in
-        /// every rule but Replace Text, which works on the whole name the way Finder's does.
-        func newName(for name: String, at index: Int, on date: Date = .now) -> String {
-            let stem = (name as NSString).deletingPathExtension
-            let ext = (name as NSString).pathExtension
+        /// every rule but Replace Text, which works on the whole name the way Finder's does. A
+        /// folder has no extension: the dot in "v1.0" is part of its name.
+        func newName(for name: String, at index: Int, on date: Date = .now, isFolder: Bool = false) -> String {
+            let stem = isFolder ? name : (name as NSString).deletingPathExtension
+            let ext = isFolder ? "" : (name as NSString).pathExtension
             func withExtension(_ stem: String) -> String { ext.isEmpty ? stem : stem + "." + ext }
             switch action {
             case .replaceText:
@@ -115,6 +116,9 @@ struct RenameSheet: View {
     let hits: [FileHit]
 
     @State private var recipe = BatchRename.Recipe()
+    /// The plan for the current recipe, rebuilt only when the recipe changes: it checks the disk
+    /// for every row, which on every keystroke froze the sheet for large selections.
+    @State private var planned: [PlannedName] = []
     /// The first field of the mode showing one, so the sheet takes typing the moment it opens.
     @FocusState private var typingFocused: Bool
 
@@ -128,7 +132,7 @@ struct RenameSheet: View {
     }
 
     var body: some View {
-        let plan = plan()
+        let plan = planned
         VStack(alignment: .leading, spacing: 14) {
             Text(hits.count == 1 ? "Rename “\(hits[0].name)”" : "Rename \(hits.count) Items")
                 .font(.headline)
@@ -157,6 +161,7 @@ struct RenameSheet: View {
         .frame(width: 480)
         .defaultFocus($typingFocused, true)
         .onChange(of: recipe.action) { typingFocused = true }
+        .onChange(of: recipe, initial: true) { planned = self.plan() }
     }
 
     @ViewBuilder private var fields: some View {
@@ -193,7 +198,7 @@ struct RenameSheet: View {
 
     private func preview(_ plan: [PlannedName]) -> some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 5) {
+            LazyVStack(alignment: .leading, spacing: 5) {
                 ForEach(plan) { planned in
                     HStack(spacing: 6) {
                         Text(planned.hit.name).foregroundStyle(.secondary)
@@ -218,27 +223,42 @@ struct RenameSheet: View {
 
     /// Every row's new name, checked against the others and the disk — a duplicate inside the
     /// batch, a file that already carries the name, or a row inside a folder the same batch
-    /// renames all disable the Rename button rather than failing halfway through.
+    /// renames all disable the Rename button rather than failing halfway through. Paths are
+    /// compared lowercased: APFS is case-insensitive by default, so "a.txt" and "A.txt" are one
+    /// name there. A row keeping its name is never checked — it is not being renamed.
     private func plan() -> [PlannedName] {
         let date = Date.now
         let names = hits.enumerated().map { index, hit in
-            (hit: hit, name: recipe.newName(for: hit.name, at: index, on: date))
+            (hit: hit, name: recipe.newName(for: hit.name, at: index, on: date, isFolder: hit.isFolder))
         }
         var counts: [String: Int] = [:]
         for (hit, name) in names {
-            counts[hit.url.deletingLastPathComponent().appending(path: name).path, default: 0] += 1
+            counts[hit.url.deletingLastPathComponent().appending(path: name).path.lowercased(), default: 0] += 1
         }
         // Sources that will move: parked first by performRename, so their old names are free.
-        let vacated = Set(names.filter { $0.name != $0.hit.name }.map(\.hit.url.path))
+        let vacated = Set(names.filter { $0.name != $0.hit.name }.map { $0.hit.url.path.lowercased() })
+        // A lookup per ancestor rather than a prefix test against every vacated path, which was
+        // quadratic: seconds per keystroke at 10,000 rows.
+        func insideVacated(_ path: String) -> Bool {
+            var ancestor = (path.lowercased() as NSString).deletingLastPathComponent
+            while !ancestor.isEmpty, ancestor != "/" {
+                if vacated.contains(ancestor) { return true }
+                ancestor = (ancestor as NSString).deletingLastPathComponent
+            }
+            return false
+        }
         return names.map { hit, name in
+            guard name != hit.name else { return PlannedName(hit: hit, name: name, problem: nil) }
             var problem = BatchRename.problem(with: name)
-            if problem == nil, name != hit.name {
+            if problem == nil {
                 let target = hit.url.deletingLastPathComponent().appending(path: name).path
-                if counts[target, default: 0] > 1 {
+                if counts[target.lowercased(), default: 0] > 1 {
                     problem = "Two items would get this name"
-                } else if vacated.contains(where: { hit.url.path.hasPrefix($0 + "/") }) {
+                } else if insideVacated(hit.url.path) {
                     problem = "Inside a folder that is also being renamed"
-                } else if !vacated.contains(target), target.lowercased() != hit.url.path.lowercased(),
+                } else if SearchModel.isLocked(hit.url) {
+                    problem = "File is locked"
+                } else if !vacated.contains(target.lowercased()), target.lowercased() != hit.url.path.lowercased(),
                           FileManager.default.fileExists(atPath: target)
                 {
                     problem = "A file with this name already exists"

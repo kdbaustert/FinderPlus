@@ -34,14 +34,14 @@ enum DocumentText {
         process.standardError = FileHandle.nullDevice
         do { try process.run() } catch { return nil }
         var data = Data()
-        while data.count < maxBytes, let chunk = try? output.fileHandleForReading.read(upToCount: 1 << 16),
-              !chunk.isEmpty
+        while data.count < maxBytes, !Task.isCancelled,
+              let chunk = try? output.fileHandleForReading.read(upToCount: 1 << 16), !chunk.isEmpty
         {
             data.append(chunk)
         }
         if process.isRunning { process.terminate() }
         process.waitUntilExit()
-        guard !data.isEmpty else { return nil }
+        guard !data.isEmpty, !Task.isCancelled else { return nil }
         return markupText(String(decoding: data, as: UTF8.self))
     }
 
@@ -64,7 +64,9 @@ enum DocumentText {
     /// Text read out of an image. The image is loaded no larger than 3000 pixels on its longest
     /// side: enough for Vision to read body text, without decoding a 50-megapixel photo whole.
     static func recognizedText(inImageAt url: URL) -> String? {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        // Checked before decoding and recognition, which cannot be interrupted once started: a
+        // preview that has moved on must not keep a core busy on text nobody will see.
+        guard !Task.isCancelled, let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceThumbnailMaxPixelSize: 3000,
@@ -79,6 +81,7 @@ enum DocumentText {
     static func recognizedText(inScannedPDF document: PDFDocument, maxPages: Int = 30) -> String? {
         var pages: [String] = []
         for index in 0..<min(document.pageCount, maxPages) {
+            if Task.isCancelled { return nil }
             guard let page = document.page(at: index) else { continue }
             let bounds = page.bounds(for: .mediaBox)
             let scale = min(2.5, 2500 / max(bounds.width, bounds.height, 1))
@@ -115,9 +118,13 @@ enum DocumentText {
             if let group = attributes[.groupOwnerAccountName] as? String { parts.append("group \(group)") }
             if let mode = attributes[.posixPermissions] as? Int { parts.append(permissions(mode)) }
         }
-        let type = UTType(filenameExtension: url.pathExtension)
-        if type?.conforms(to: .image) == true { parts += imageMetadata(of: url) }
-        if type?.conforms(to: .audio) == true { parts += audioMetadata(of: url) }
+        // The stat above reads no file data; the headers below do, and reading an iCloud
+        // placeholder downloads it — a Metadata search would pull down every evicted photo and song.
+        if !SearchEngine.isPlaceholder(url) {
+            let type = UTType(filenameExtension: url.pathExtension)
+            if type?.conforms(to: .image) == true { parts += imageMetadata(of: url) }
+            if type?.conforms(to: .audio) == true { parts += audioMetadata(of: url) }
+        }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 

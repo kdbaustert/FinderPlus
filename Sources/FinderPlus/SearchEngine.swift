@@ -153,7 +153,8 @@ enum SearchEngine {
             let now = ContinuousClock.now
             guard force || now - lastFlush >= .milliseconds(120) else { return }
             lastFlush = now
-            if limits.maxResults > 0, reported + pending.count >= limits.maxResults {
+            // Past the limit, not at it: exactly that many matches is every match, not a cut-off.
+            if limits.maxResults > 0, reported + pending.count > limits.maxResults {
                 pending = Array(pending.prefix(limits.maxResults - reported))
                 reachedLimit = true
             }
@@ -248,6 +249,9 @@ enum SearchEngine {
         }
 
         for root in request.roots {
+            // The enumerator does not follow a root that is itself a symlink — a ~/Documents linked
+            // to another disk would list nothing — so the link is resolved first.
+            let root = root.resolvingSymlinksInPath()
             // The canonical path, not `resolvingSymlinksInPath()`: that strips `/private`, while the
             // enumerator yields `/private/var/...` for a root under `/var`.
             let rootPath = (try? root.resourceValues(forKeys: [.canonicalPathKey]).canonicalPath) ?? root.path
@@ -397,7 +401,7 @@ enum SearchEngine {
     static func contentText(
         of url: URL, size: Int64, maxBytes: Int = SearchLimits().maxContentBytes, recognizeText: Bool = false
     ) -> String? {
-        guard size > 0, size <= maxBytes else { return nil }
+        guard size > 0, size <= maxBytes, !Task.isCancelled else { return nil }
         // An iCloud file that is not downloaded is a placeholder, and reading it downloads it — a
         // content search of iCloud Drive would otherwise pull the whole drive down.
         if isPlaceholder(url) { return nil }
@@ -412,7 +416,8 @@ enum SearchEngine {
             }
             return text
         }
-        if recognizeText, let type, type.conforms(to: .image) {
+        // SVG is an image written as text: its words are read directly, where OCR would find none.
+        if recognizeText, let type, type.conforms(to: .image), !type.conforms(to: .text) {
             return DocumentText.recognizedText(inImageAt: url)
         }
         if let type, richTextTypes.contains(where: type.conforms(to:)) {
@@ -437,7 +442,10 @@ enum SearchEngine {
             return String(data: data, encoding: .utf16)
         }
         if data.prefix(8192).contains(0) { return nil }
+        // Latin-1 last: it accepts every byte, including the five Windows-1252 leaves undefined
+        // (0x81, 0x8D, 0x8F, 0x90, 0x9D), which Mac Roman text uses for letters.
         return String(data: data, encoding: .utf8) ?? String(data: data, encoding: .windowsCP1252)
+            ?? String(data: data, encoding: .isoLatin1)
     }
 }
 
@@ -472,13 +480,19 @@ enum DuplicateFinder {
 
     static func sets(in candidates: [Candidate]) -> [[FileHit.ID]] {
         let headLength = 64 * 1024
+        // Checked per file: hashing a big library takes minutes, and whoever asked may have moved on.
+        // A cancelled file hashes to nil, so it joins no set; the partial result is discarded.
+        func digest(of candidate: Candidate, limit: Int?) -> String? {
+            Task.isCancelled ? nil : Self.digest(of: candidate.url, limit: limit, size: candidate.size)
+        }
         var sets: [[FileHit.ID]] = []
         for sameSize in Dictionary(grouping: candidates, by: \.size).values where sameSize.count > 1 {
-            for (head, sameHead) in Dictionary(grouping: sameSize, by: { digest(of: $0.url, limit: headLength) })
+            if Task.isCancelled { return [] }
+            for (head, sameHead) in Dictionary(grouping: sameSize, by: { digest(of: $0, limit: headLength) })
             where head != nil && sameHead.count > 1 {
                 let identical = sameSize[0].size <= Int64(headLength)
                     ? [head: sameHead]
-                    : Dictionary(grouping: sameHead, by: { digest(of: $0.url, limit: nil) })
+                    : Dictionary(grouping: sameHead, by: { digest(of: $0, limit: nil) })
                 for (whole, set) in identical where whole != nil && set.count > 1 {
                     sets.append(set.map(\.id))
                 }
@@ -489,18 +503,29 @@ enum DuplicateFinder {
 
     /// SHA-256 of the first `limit` bytes, or of everything. Nil for a file that cannot be read
     /// or is an iCloud placeholder, which reading would download.
-    static func digest(of url: URL, limit: Int?) -> String? {
+    ///
+    /// `size` is the size the search recorded. A read error, or a file that has grown or shrunk
+    /// since, is nil too: a hash of a cut-short stream can equal another file's, and the head
+    /// hash stands in for the whole one on a small file.
+    static func digest(of url: URL, limit: Int?, size: Int64) -> String? {
         if SearchEngine.isPlaceholder(url) { return nil }
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
         var hasher = SHA256()
         var read = 0
         while limit.map({ read < $0 }) ?? true {
-            let chunk = (try? handle.read(upToCount: min(1 << 20, limit.map { $0 - read } ?? 1 << 20))) ?? nil
+            // Not `try?`: that flattens a read error into the nil that means end of file.
+            let chunk: Data?
+            do {
+                chunk = try handle.read(upToCount: min(1 << 20, limit.map { $0 - read } ?? 1 << 20))
+            } catch {
+                return nil
+            }
             guard let chunk, !chunk.isEmpty else { break }
             hasher.update(data: chunk)
             read += chunk.count
         }
+        guard Int64(read) == limit.map({ min(Int64($0), size) }) ?? size else { return nil }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 }

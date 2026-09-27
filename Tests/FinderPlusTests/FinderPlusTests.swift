@@ -2,6 +2,7 @@ import AppKit
 import ImageIO
 import UniformTypeIdentifiers
 import XCTest
+import os
 @testable import FinderPlus
 
 final class QueryMatcherTests: XCTestCase {
@@ -463,6 +464,16 @@ final class AuditFixTests: XCTestCase {
         XCTAssertLessThan(started.duration(to: .now), .seconds(1))
         XCTAssertEqual(QueryMatcher.wildcardPattern("*.pdf*", anchored: false), "\\.pdf")
         XCTAssertEqual(QueryMatcher.wildcardPattern("*.pdf", anchored: true), "^.*\\.pdf$")
+
+        // A `*` in the middle used to become `.*`, which ICU rescans from every match of the
+        // first piece — quadratic on one long line. Trimming the ends never covered it.
+        let middle = try QueryMatcher(query: "e*q", options: options, anchorsWildcards: false)
+        let long = String(repeating: "e", count: 500_000)
+        let middleStarted = ContinuousClock.now
+        XCTAssertFalse(middle.matches(long))
+        XCTAssertTrue(middle.matches(long + "q"))
+        XCTAssertFalse(middle.matches("e\nq"), "`.*` never crossed a line break; the pieces must not either")
+        XCTAssertLessThan(middleStarted.duration(to: .now), .seconds(1))
     }
 
     // Audit 3: Stop now reaches the walk and its content workers.
@@ -473,10 +484,26 @@ final class AuditFixTests: XCTestCase {
     }
 
     // Audit 10: a query of exclusions alone now says why instead of clearing the results.
+    // Any Word used to fall through to `.empty`, which the window treats as "no query" and
+    // silently ignores — so it is asserted alongside the default mode.
     func testExclusionsOnlyQueryExplainsItself() {
-        XCTAssertThrowsError(try QueryMatcher(query: "-draft", options: SearchOptions())) { error in
-            guard case QueryError.onlyExclusions = error else { return XCTFail("\(error)") }
+        for mode in [MatchMode.allWords, .anyWord] {
+            var options = SearchOptions()
+            options.mode = mode
+            XCTAssertThrowsError(try QueryMatcher(query: "-draft", options: options)) { error in
+                guard case QueryError.onlyExclusions = error else { return XCTFail("\(mode): \(error)") }
+            }
         }
+    }
+
+    // Stopping an unstarted walk proves little: a stop that arrives mid-batch must also halt it.
+    func testStoppingMidWalkHaltsIt() throws {
+        for index in 0..<50 { _ = try write("file\(index).txt", "needle") }
+        let polls = OSAllocatedUnfairLock(initialState: 0)
+        let hits = try walk("needle", { $0.searchNames = false; $0.searchContents = true }) {
+            polls.withLock { $0 += 1; return $0 > 10 }
+        }
+        XCTAssertLessThan(hits.count, 50)
     }
 
     // Audit 11: another user whose name starts with this one's must not become "~b/…".
@@ -887,6 +914,43 @@ final class BatchRenameTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: two, encoding: .utf8), "first")
         // Nothing left parked under a holding name.
         let leftovers = try FileManager.default.contentsOfDirectory(atPath: folder.path)
+            .filter { $0.hasPrefix(".FinderPlus-rename-") }
+        XCTAssertEqual(leftovers, [])
+    }
+
+    // A locked file used to strand another file's content under a hidden holding name, because
+    // the rollback was a silent `try?` onto a name an earlier step had already taken.
+    func testAFailedRenameRollsTheWholeBatchBack() throws {
+        let manager = FileManager.default
+        let folder = manager.temporaryDirectory.appending(path: "FinderPlusRename-\(UUID().uuidString)")
+        try manager.createDirectory(at: folder, withIntermediateDirectories: true)
+        let one = folder.appending(path: "Photo 1.jpg")
+        let two = folder.appending(path: "Photo 2.jpg")
+        let three = folder.appending(path: "Photo 3.jpg")
+        try "first".write(to: one, atomically: true, encoding: .utf8)
+        try "second".write(to: two, atomically: true, encoding: .utf8)
+        try "third".write(to: three, atomically: true, encoding: .utf8)
+        try manager.setAttributes([.immutable: true], ofItemAtPath: three.path)
+        defer {
+            try? manager.setAttributes([.immutable: false], ofItemAtPath: three.path)
+            try? manager.removeItem(at: folder)
+        }
+
+        // Renumbering 1, 2, 3 up to 2, 3, 4: the locked file blocks its own move, and the whole
+        // batch must come back rather than leave "Photo 2" both taken and parked.
+        let outcome = SearchModel.performRename([
+            RenameStep(source: one, target: two),
+            RenameStep(source: two, target: three),
+            RenameStep(source: three, target: folder.appending(path: "Photo 4.jpg")),
+        ])
+        XCTAssertTrue(outcome.done.isEmpty)
+        XCTAssertFalse(outcome.failed.isEmpty)
+        // Locked is not a Full Disk Access problem: granting access would not unlock the file.
+        XCTAssertFalse(outcome.deniedByPermissions)
+        XCTAssertEqual(try String(contentsOf: one, encoding: .utf8), "first")
+        XCTAssertEqual(try String(contentsOf: two, encoding: .utf8), "second")
+        XCTAssertEqual(try String(contentsOf: three, encoding: .utf8), "third")
+        let leftovers = try manager.contentsOfDirectory(atPath: folder.path)
             .filter { $0.hasPrefix(".FinderPlus-rename-") }
         XCTAssertEqual(leftovers, [])
     }

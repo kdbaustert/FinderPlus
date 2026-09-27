@@ -14,7 +14,8 @@ struct PreviewPane: View {
                         .padding(14)
                     Rectangle().fill(Color.border).frame(height: 1)
                     if let context = model.previewContext, hit.snippet != nil, !hit.isArchiveEntry {
-                        MatchesPreview(hit: hit, context: context)
+                        MatchesPreview(hit: hit, context: context,
+                                       maxBytes: model.settings.limits.maxContentBytes)
                             .id(hit.id)
                     } else {
                         QuickLookView(url: hit.url)
@@ -64,6 +65,8 @@ private struct PreviewHeader: View {
 private struct MatchesPreview: View {
     let hit: FileHit
     let context: SearchModel.PreviewContext
+    /// The "Largest file to read" setting, so any file the search could read inside can be shown.
+    let maxBytes: Int
     @State private var loaded: (text: String, ranges: [NSRange])?
     @State private var isLoading = true
 
@@ -79,14 +82,22 @@ private struct MatchesPreview: View {
             }
         }
         .task {
-            let (url, size, context) = (hit.url, hit.size, context)
-            loaded = await Task.detached {
-                let full = SearchEngine.contentText(of: url, size: size, recognizeText: context.recognizeText)
+            let (url, size, context, maxBytes) = (hit.url, hit.size, context, maxBytes)
+            // Held and cancelled by hand: a detached task outlives this view's task, so arrowing
+            // through results would otherwise pile up full extractions (OCR ones especially).
+            let extraction = Task.detached { () -> (text: String, ranges: [NSRange])? in
+                let full = SearchEngine.contentText(
+                    of: url, size: size, maxBytes: maxBytes, recognizeText: context.recognizeText)
                     ?? DocumentText.metadataText(of: url)
-                guard let full else { return nil }
+                guard let full, !Task.isCancelled else { return nil }
                 let text = (full as NSString).length > 1_000_000 ? (full as NSString).substring(to: 1_000_000) : full
                 return (text, context.matcher.ranges(in: text))
-            }.value
+            }
+            loaded = await withTaskCancellationHandler {
+                await extraction.value
+            } onCancel: {
+                extraction.cancel()
+            }
             isLoading = false
         }
     }

@@ -57,6 +57,11 @@ struct ContentView: View {
         .sheet(item: Bindable(model).renameRequest) { request in
             RenameSheet(hits: request.hits)
         }
+        // Here rather than on the Location menu, which is gone while the sidebar is hidden and
+        // would leave ⌘L doing nothing until the sidebar came back.
+        .fileImporter(isPresented: Bindable(model).choosingFolder, allowedContentTypes: [.folder]) { result in
+            if case .success(let url) = result { model.addFolders([url]) }
+        }
         .task { model.checkFullDiskAccessAtLaunch() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             model.recheckFullDiskAccess()
@@ -293,9 +298,9 @@ struct OptionsPanel: View {
                         .help("Read the text in photos, screenshots and scanned PDFs. Much slower.")
                     Toggle("Tags", isOn: $model.options.searchTags)
                     Toggle("Comments", isOn: $model.options.searchComments)
+                        .help("The comment from Finder’s Get Info window")
                     Toggle("Metadata", isOn: $model.options.searchMetadata)
                         .help("Camera, lens and date taken; artist, album and title; owner and permissions.")
-                        .help("The comment from Finder’s Get Info window")
                 }
 
                 OptionSection("Operator") {
@@ -410,7 +415,6 @@ struct LocationMenu: View {
     @State private var driveRevision = 0
 
     var body: some View {
-        @Bindable var model = model
         let _ = driveRevision
         let drives = SearchLocation.drives()
         Menu {
@@ -455,9 +459,6 @@ struct LocationMenu: View {
                 .allowsHitTesting(false)
         }
         .help(model.location.help)
-        .fileImporter(isPresented: $model.choosingFolder, allowedContentTypes: [.folder]) { result in
-            if case .success(let url) = result { model.addFolders([url]) }
-        }
         .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didMountNotification)) { _ in
             driveRevision += 1
         }
@@ -627,7 +628,12 @@ struct ResultsView: View {
             model.toggleQuickLook()
             return .handled
         }
-        .onDeleteCommand { Task { await model.trash() } }
+        // Finder trashes on ⌘⌫ only; a bare ⌫ is too easy to hit, and with "Ask before moving to
+        // Trash" off it would trash the selection outright. ⌘⌫ normally reaches the menu item first.
+        .onDeleteCommand {
+            guard NSApp.currentEvent?.modifierFlags.contains(.command) == true else { return }
+            Task { await model.trash() }
+        }
         .onChange(of: model.sortOrder) { model.resort() }
     }
 
