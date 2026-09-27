@@ -176,8 +176,9 @@ struct SearchHeader: View {
                         Button(role: .cancel) { model.stop() } label: {
                             Label("Stop", systemImage: "stop.fill").padding(.horizontal, 4)
                         }
-                        .buttonStyle(.borderless)
-                        .controlSize(.large)
+                        .buttonStyle(.glassProminent)
+                        .tint(.red)
+                        .controlSize(.extraLarge)
                     } else {
                         Button { model.start() } label: {
                             Label("Find", systemImage: "arrow.forward").padding(.horizontal, 4)
@@ -202,6 +203,7 @@ struct SearchHeader: View {
         .animation(.smooth(duration: 0.3), value: model.isSearching)
         .animation(.spring(duration: 0.4, bounce: 0.15), value: model.showsSidebar)
         .onChange(of: model.focusRequest) { fieldFocused = true }
+        .onChange(of: fieldFocused) { model.isEditingQuery = fieldFocused }
         // Initial focus only. Focusing on every appearance re-selected the whole query whenever the
         // header was rebuilt, so the next keystroke replaced everything already typed.
         .defaultFocus($fieldFocused, true)
@@ -297,10 +299,36 @@ struct OptionsPanel: View {
                         .disabled(model.options.usesFuzzy)
                 }
 
+                OptionSection("Filters") {
+                    Picker("Modified", selection: $model.options.modified) {
+                        ForEach(DateFilter.allCases) { Text($0.title).tag($0) }
+                    }
+                    Picker("Size", selection: $model.options.size) {
+                        ForEach(SizeFilter.allCases) { Text($0.title).tag($0) }
+                    }
+                    Text("Leave out")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 4)
+                    ForEach(KindGroup.allCases) { group in
+                        Toggle(group.title, isOn: Binding(
+                            get: { model.options.excludedKinds.contains(group) },
+                            set: { isOn in
+                                if isOn {
+                                    model.options.excludedKinds.insert(group)
+                                } else {
+                                    model.options.excludedKinds.remove(group)
+                                }
+                            }))
+                    }
+                }
+
                 OptionSection("Include") {
                     Toggle("Package Contents", isOn: $model.options.includePackageContents)
                         .help("Look inside apps, bundles and other packages")
                     Toggle("Invisible Files & Folders", isOn: $model.options.includeHidden)
+                    Toggle("Inside Zip Archives", isOn: $model.options.includeArchiveContents)
+                        .help("List the files inside .zip archives by name, without unpacking them")
                     Toggle("Applications", isOn: $model.options.includeApplications)
                         .help("Apps and the Applications folders. Turn off to leave them out of searches.")
                     Toggle("System Folders", isOn: Binding(
@@ -472,7 +500,7 @@ struct ResultsView: View {
         return Table(of: FileHit.self, selection: $model.selection, sortOrder: $model.sortOrder) {
             TableColumn("Name", value: \.name) { hit in
                 HStack(spacing: 7) {
-                    Image(nsImage: NSWorkspace.shared.icon(forFile: hit.url.path))
+                    Image(nsImage: Self.icon(for: hit))
                         .resizable()
                         .frame(width: 18, height: 18)
                     Text(hit.name).lineLimit(1)
@@ -526,6 +554,13 @@ struct ResultsView: View {
             }
             .width(min: 110, ideal: 150)
 
+            TableColumn("Date Created", value: \.created) { hit in
+                Text(hit.created, format: .dateTime.year().month(.abbreviated).day().hour().minute())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .width(min: 110, ideal: 150)
+
         } rows: {
             ForEach(model.results) { hit in
                 TableRow(hit).draggable(hit.url)
@@ -541,7 +576,7 @@ struct ResultsView: View {
             tableFocused = true
             if model.selection.isEmpty, let first = model.results.first { model.selection = [first.id] }
         }
-        .contextMenu(forSelectionType: URL.self) { ids in
+        .contextMenu(forSelectionType: FileHit.ID.self) { ids in
             ResultMenu(ids: ids)
         } primaryAction: { ids in
             model.performDefaultAction(ids)
@@ -577,6 +612,13 @@ struct ResultsView: View {
         }
     }
 
+    /// A file inside an archive has no file of its own to ask for an icon, so it gets its type's.
+    static func icon(for hit: FileHit) -> NSImage {
+        guard hit.isArchiveEntry else { return NSWorkspace.shared.icon(forFile: hit.url.path) }
+        let type = hit.isFolder ? UTType.folder : UTType(filenameExtension: (hit.name as NSString).pathExtension) ?? .data
+        return NSWorkspace.shared.icon(for: type)
+    }
+
     static func highlighted(_ snippet: Snippet?) -> AttributedString {
         guard let snippet else { return AttributedString() }
         var text = AttributedString(snippet.text)
@@ -590,7 +632,7 @@ struct ResultsView: View {
 
 struct ResultMenu: View {
     @Environment(SearchModel.self) private var model
-    let ids: Set<URL>
+    let ids: Set<FileHit.ID>
 
     var body: some View {
         if !ids.isEmpty {

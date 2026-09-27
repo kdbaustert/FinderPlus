@@ -52,7 +52,9 @@ struct SearchCommands: Commands {
             Divider()
             Button("Move to Trash") { Task { await model.trash() } }
                 .keyboardShortcut(.delete)
-                .disabled(model.selection.isEmpty)
+                // ⌘⌫ in the search field deletes to the start of the line; menu shortcuts are
+                // matched first, so without this it would trash the selected results instead.
+                .disabled(model.selection.isEmpty || model.isEditingQuery)
         }
         CommandGroup(replacing: .sidebar) {
             Button(model.showsSidebar ? "Hide Search Options" : "Show Search Options") { model.showsSidebar.toggle() }

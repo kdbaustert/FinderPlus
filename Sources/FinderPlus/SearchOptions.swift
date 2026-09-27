@@ -49,6 +49,77 @@ enum MatchMode: String, CaseIterable, Identifiable, Codable, Sendable {
     }
 }
 
+/// "Modified within" — EasyFind-style date narrowing, measured back from when the search starts.
+enum DateFilter: String, CaseIterable, Identifiable, Codable, Sendable {
+    case any, today, week, month, year
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .any: "Any Time"
+        case .today: "Today"
+        case .week: "Past 7 Days"
+        case .month: "Past 30 Days"
+        case .year: "Past Year"
+        }
+    }
+
+    func cutoff(from now: Date, calendar: Calendar = .current) -> Date? {
+        switch self {
+        case .any: nil
+        case .today: calendar.startOfDay(for: now)
+        case .week: calendar.date(byAdding: .day, value: -7, to: now)
+        case .month: calendar.date(byAdding: .day, value: -30, to: now)
+        case .year: calendar.date(byAdding: .year, value: -1, to: now)
+        }
+    }
+}
+
+enum SizeFilter: String, CaseIterable, Identifiable, Codable, Sendable {
+    case any, under1MB, over1MB, over100MB, over1GB
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .any: "Any Size"
+        case .under1MB: "Under 1 MB"
+        case .over1MB: "Over 1 MB"
+        case .over100MB: "Over 100 MB"
+        case .over1GB: "Over 1 GB"
+        }
+    }
+
+    /// `size` is -1 for folders and packages, which only "Any Size" accepts: their size is unknown.
+    func accepts(_ size: Int64) -> Bool {
+        let megabyte: Int64 = 1_000_000
+        switch self {
+        case .any: return true
+        case .under1MB: return size >= 0 && size < megabyte
+        case .over1MB: return size > megabyte
+        case .over100MB: return size > 100 * megabyte
+        case .over1GB: return size > 1_000 * megabyte
+        }
+    }
+}
+
+/// Kinds of file that can be left out of results.
+enum KindGroup: String, CaseIterable, Identifiable, Codable, Sendable {
+    case images, video, audio, archives
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .images: "Images"
+        case .video: "Video"
+        case .audio: "Audio"
+        case .archives: "Archives"
+        }
+    }
+}
+
 struct SearchOptions: Equatable, Codable, Sendable {
     var kind: SearchKind = .filesAndFolders
     var searchNames = true
@@ -67,6 +138,12 @@ struct SearchOptions: Equatable, Codable, Sendable {
     var includeHidden = false
     var excludeSystemFolders = true
     var includeApplications = true
+    /// List the files inside zip archives, as if they were folders.
+    var includeArchiveContents = false
+
+    var modified: DateFilter = .any
+    var size: SizeFilter = .any
+    var excludedKinds: Set<KindGroup> = []
 
     var searchesAnyField: Bool { searchNames || searchContents || searchTags || searchComments }
     var usesFuzzy: Bool { fuzzy && mode.supportsFuzzy }
@@ -107,6 +184,10 @@ extension SearchOptions {
         includeHidden = value(.includeHidden, defaults.includeHidden)
         excludeSystemFolders = value(.excludeSystemFolders, defaults.excludeSystemFolders)
         includeApplications = value(.includeApplications, defaults.includeApplications)
+        includeArchiveContents = value(.includeArchiveContents, defaults.includeArchiveContents)
+        modified = value(.modified, defaults.modified)
+        size = value(.size, defaults.size)
+        excludedKinds = value(.excludedKinds, defaults.excludedKinds)
     }
 }
 

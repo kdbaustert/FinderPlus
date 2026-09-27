@@ -4,23 +4,50 @@ import PDFKit
 import UniformTypeIdentifiers
 
 struct FileHit: Identifiable, Hashable, Sendable {
+    /// The file — or, for an entry listed from a zip archive, the archive that holds it.
     let url: URL
+    /// The entry's path inside the archive at `url`; nil for an ordinary file.
+    let archiveEntry: String?
     let name: String
     let isFolder: Bool
-    /// -1 for folders and packages, whose size the walk does not total.
+    /// -1 for folders, packages and archive entries, whose size the walk does not know.
     let size: Int64
     let modified: Date
+    let created: Date
     let kind: String
     var snippet: Snippet?
 
-    var id: URL { url }
-    var parentPath: String { url.deletingLastPathComponent().path }
+    init(
+        url: URL, archiveEntry: String? = nil, name: String, isFolder: Bool, size: Int64,
+        modified: Date, created: Date = .distantPast, kind: String, snippet: Snippet? = nil
+    ) {
+        self.url = url
+        self.archiveEntry = archiveEntry
+        self.name = name
+        self.isFolder = isFolder
+        self.size = size
+        self.modified = modified
+        self.created = created
+        self.kind = kind
+        self.snippet = snippet
+    }
+
+    /// Unique per row: every entry of an archive shares the archive's URL.
+    var id: String { archiveEntry.map { url.path + "\u{0}" + $0 } ?? url.path }
+    var isArchiveEntry: Bool { archiveEntry != nil }
     var snippetText: String { snippet?.text ?? "" }
+
+    /// The file's path; for an archive entry, the archive's path followed by the entry's.
+    var fullPath: String { archiveEntry.map { url.path + "/" + $0 } ?? url.path }
+
+    var parentPath: String { (fullPath as NSString).deletingLastPathComponent }
 
     var displayParent: String {
         let home = NSHomeDirectory()
         let parent = parentPath
-        return parent.hasPrefix(home) ? "~" + parent.dropFirst(home.count) : parent
+        // A whole path component only: `/Users/kennyb` must not become `~b`.
+        guard parent == home || parent.hasPrefix(home + "/") else { return parent }
+        return "~" + parent.dropFirst(home.count)
     }
 
     var sizeText: String {
@@ -72,6 +99,7 @@ enum SearchEngine {
 
     private static let resourceKeys: Set<URLResourceKey> = [
         .isDirectoryKey, .isPackageKey, .isRegularFileKey, .fileSizeKey, .contentModificationDateKey,
+        .creationDateKey,
     ]
 
     private static let richTextTypes: [UTType] = [
@@ -83,21 +111,29 @@ enum SearchEngine {
 
     static func run(_ request: SearchRequest) -> AsyncStream<SearchEvent> {
         AsyncStream { continuation in
-            let task = Task.detached(priority: .userInitiated) {
-                walk(request) { continuation.yield($0) }
+            let stop = StopFlag()
+            // A thread of its own rather than Swift's cooperative pool: the walk blocks for its
+            // whole run, and one that is being abandoned must not hold a thread async work needs.
+            DispatchQueue.global(qos: .userInitiated).async {
+                walk(request, isStopped: stop.isSet) { continuation.yield($0) }
                 continuation.finish()
             }
-            continuation.onTermination = { _ in task.cancel() }
+            continuation.onTermination = { _ in stop.set() }
         }
     }
 
     /// Synchronous on purpose: `NSEnumerator` cannot be iterated from an async context in Swift 6.
-    /// Cancellation still works — `Task.isCancelled` reads the detached task this runs on.
-    static func walk(_ request: SearchRequest, emit: (SearchEvent) -> Void) {
+    /// `isStopped` is checked between items and before each file a content search reads, so Stop
+    /// takes effect even in the middle of a batch.
+    static func walk(
+        _ request: SearchRequest, isStopped: @Sendable () -> Bool = { false }, emit: (SearchEvent) -> Void
+    ) {
         let options = request.options
         // Tags cost an extended-attribute read per file — measured at half the walk's time — so
         // they are fetched only when they are being searched.
         let resourceKeys = options.searchTags ? resourceKeys.union([.tagNamesKey]) : resourceKeys
+        let modifiedCutoff = options.modified.cutoff(from: .now)
+        var excludedExtensions: [String: Bool] = [:]
         var enumeratorOptions: FileManager.DirectoryEnumerationOptions = []
         if !options.includeHidden { enumeratorOptions.insert(.skipsHiddenFiles) }
         if !options.includePackageContents { enumeratorOptions.insert(.skipsPackageDescendants) }
@@ -134,6 +170,7 @@ enum SearchEngine {
             candidates.removeAll(keepingCapacity: true)
             let found = OSAllocatedUnfairLock(initialState: [FileHit]())
             DispatchQueue.concurrentPerform(iterations: batch.count) { index in
+                guard !isStopped() else { return }
                 var hit = batch[index]
                 guard let text = contentText(of: hit.url, size: hit.size, maxBytes: limits.maxContentBytes),
                       let snippet = request.textMatcher.snippet(in: text)
@@ -143,6 +180,50 @@ enum SearchEngine {
                 found.withLock { $0.append(matched) }
             }
             pending.append(contentsOf: found.withLock { $0 })
+        }
+
+        func isExcludedKind(_ ext: String) -> Bool {
+            guard !options.excludedKinds.isEmpty, !ext.isEmpty else { return false }
+            if let cached = excludedExtensions[ext] { return cached }
+            let type = UTType(filenameExtension: ext)
+            let excluded = type.map { type in options.excludedKinds.contains { type.conforms(to: $0.type) } } ?? false
+            excludedExtensions[ext] = excluded
+            return excluded
+        }
+
+        /// Lists a zip's entries by name. Their sizes are unknown, so a size filter leaves them out;
+        /// dates are the archive's own.
+        func searchArchive(at archive: URL, modified: Date, created: Date) {
+            for entry in zipEntries(of: archive) {
+                if isStopped() { return }
+                let isEntryFolder = entry.hasSuffix("/")
+                let path = isEntryFolder ? String(entry.dropLast()) : entry
+                let name = (path as NSString).lastPathComponent
+                // Finder's resource-fork shadows, not files anyone put in the archive.
+                guard !name.isEmpty, !path.hasPrefix("__MACOSX"), !name.hasPrefix("._") else { continue }
+                if name.hasPrefix("."), !options.includeHidden { continue }
+                let wanted = switch options.kind {
+                case .filesAndFolders: true
+                case .files: !isEntryFolder
+                case .folders: isEntryFolder
+                }
+                let entryExt = (name as NSString).pathExtension.lowercased()
+                guard wanted,
+                      passesFilters(ext: entryExt, isFolder: isEntryFolder, size: -1, modified: modified),
+                      request.nameMatcher.matches(name)
+                else { continue }
+                pending.append(FileHit(
+                    url: archive, archiveEntry: path, name: name, isFolder: isEntryFolder, size: -1,
+                    modified: modified, created: created,
+                    kind: kind(for: URL(filePath: name), isFolder: isEntryFolder)))
+            }
+        }
+
+        /// Date, size and kind filters from the options panel.
+        func passesFilters(ext: String, isFolder: Bool, size: Int64, modified: Date) -> Bool {
+            if let modifiedCutoff, modified < modifiedCutoff { return false }
+            if !options.size.accepts(size) { return false }
+            return isFolder || !isExcludedKind(ext)
         }
 
         func kind(for url: URL, isFolder: Bool) -> String {
@@ -170,7 +251,7 @@ enum SearchEngine {
             else { continue }
 
             while let url = enumerator.nextObject() as? URL {
-                if Task.isCancelled { return }
+                if isStopped() { return }
                 scanned += 1
                 guard let values = try? url.resourceValues(forKeys: resourceKeys) else { continue }
                 let isDirectory = values.isDirectory ?? false
@@ -196,14 +277,19 @@ enum SearchEngine {
                         isFolder: isFolder,
                         size: isRegularFile ? Int64(values.fileSize ?? 0) : -1,
                         modified: values.contentModificationDate ?? .distantPast,
+                        created: values.creationDate ?? .distantPast,
                         kind: kind(for: url, isFolder: isFolder))
                 }
 
-                let isWanted = switch options.kind {
+                let isWantedKind = switch options.kind {
                 case .filesAndFolders: true
                 case .files: !isFolder
                 case .folders: isFolder
                 }
+                let ext = url.pathExtension.lowercased()
+                let isWanted = isWantedKind && passesFilters(
+                    ext: ext, isFolder: isFolder, size: isRegularFile ? Int64(values.fileSize ?? 0) : -1,
+                    modified: values.contentModificationDate ?? .distantPast)
                 if isWanted {
                     // Cheapest fields first; contents are read later, in parallel, only for items
                     // nothing else matched.
@@ -216,6 +302,10 @@ enum SearchEngine {
                         candidates.append(makeHit())
                         if candidates.count >= 64 { searchCandidateContents() }
                     }
+                }
+                if options.includeArchiveContents, options.searchNames, isRegularFile, ext == "zip" {
+                    searchArchive(at: url, modified: values.contentModificationDate ?? .distantPast,
+                                  created: values.creationDate ?? .distantPast)
                 }
                 flush(current: url.path)
                 if reachedLimit {
@@ -269,6 +359,22 @@ enum SearchEngine {
         return (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? String
     }
 
+    /// The entry paths in a zip archive, read from its central directory by `zipinfo` — no
+    /// extraction. An unreadable or encrypted archive yields nothing.
+    static func zipEntries(of archive: URL) -> [String] {
+        let process = Process()
+        process.executableURL = URL(filePath: "/usr/bin/zipinfo")
+        process.arguments = ["-1", archive.path]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return [] }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
+        return text.split(whereSeparator: \.isNewline).map(String.init)
+    }
+
     /// Plain text, PDF and word-processor documents. Anything else is sniffed: no NUL bytes in the
     /// first 8 KB means it is treated as text, which catches source files with unknown extensions.
     static func contentText(of url: URL, size: Int64, maxBytes: Int = SearchLimits().maxContentBytes) -> String? {
@@ -288,7 +394,9 @@ enum SearchEngine {
         let isText = type?.conforms(to: .text) ?? false
         let isUnknown = type == nil || type?.isDynamic == true
         guard isText || isUnknown else { return nil }
-        guard let data = try? Data(contentsOf: url, options: .alwaysMapped) else { return nil }
+        // A plain read: decoding copies the bytes anyway, and a mapped file whose volume goes
+        // away mid-read takes the process down with SIGBUS.
+        guard let data = try? Data(contentsOf: url) else { return nil }
         return decode(data)
     }
 
@@ -298,5 +406,24 @@ enum SearchEngine {
         }
         if data.prefix(8192).contains(0) { return nil }
         return String(data: data, encoding: .utf8) ?? String(data: data, encoding: .windowsCP1252)
+    }
+}
+
+/// Set once when a search's consumer goes away; read by the walk and its content workers.
+final class StopFlag: Sendable {
+    private let stopped = OSAllocatedUnfairLock(initialState: false)
+
+    func set() { stopped.withLock { $0 = true } }
+    @Sendable func isSet() -> Bool { stopped.withLock { $0 } }
+}
+
+extension KindGroup {
+    var type: UTType {
+        switch self {
+        case .images: .image
+        case .video: .movie
+        case .audio: .audio
+        case .archives: .archive
+        }
     }
 }

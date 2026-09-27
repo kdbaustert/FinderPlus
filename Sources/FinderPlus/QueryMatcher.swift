@@ -2,11 +2,13 @@ import Foundation
 
 enum QueryError: LocalizedError {
     case empty
+    case onlyExclusions
     case invalidPattern(String)
 
     var errorDescription: String? {
         switch self {
         case .empty: "Type something to search for."
+        case .onlyExclusions: "Add a word to look for — words starting with - or NOT only leave things out."
         case .invalidPattern(let pattern): "“\(pattern)” is not a valid pattern."
         }
     }
@@ -105,8 +107,9 @@ struct QueryMatcher: @unchecked Sendable {
             clauses = [Clause(required: [try regex(source)], excluded: [])]
         }
         // A clause of exclusions alone would match nearly every file on the disk.
+        let hadExclusions = clauses.contains { !$0.excluded.isEmpty }
         clauses.removeAll { $0.required.isEmpty }
-        guard !clauses.isEmpty else { throw QueryError.empty }
+        guard !clauses.isEmpty else { throw hadExclusions ? QueryError.onlyExclusions : QueryError.empty }
         self.clauses = clauses
     }
 
@@ -118,8 +121,11 @@ struct QueryMatcher: @unchecked Sendable {
     /// A one-line excerpt around the first match, or nil when the text does not match.
     func snippet(in text: String, context: Int = 40) -> Snippet? {
         let folded = subject(for: text)
-        guard let range = firstMatch(in: folded) else { return nil }
+        guard var range = firstMatch(in: folded) else { return nil }
         let subject = folded as NSString
+        // Never trust a range past the end: an excerpt must not be able to crash a search.
+        range.location = min(range.location, subject.length)
+        range.length = min(range.length, subject.length - range.location)
         // Folding usually preserves UTF-16 length; when it does, excerpt the original so the
         // snippet keeps its accents.
         let original = text as NSString
@@ -231,6 +237,14 @@ struct QueryMatcher: @unchecked Sendable {
     }
 
     static func wildcardPattern(_ text: String, anchored: Bool) -> String {
+        // Unanchored, a leading or trailing `*` changes nothing about whether text matches — but
+        // `.*x` makes the regex engine rescan every line from each position, which on a single
+        // long line (minified JSON) is quadratic: 100,000 characters measured at 48 seconds.
+        var text = Substring(text)
+        if !anchored {
+            let trimmed = text.drop { $0 == "*" }.reversed().drop { $0 == "*" }.reversed()
+            if !trimmed.isEmpty { text = Substring(String(trimmed)) }
+        }
         var pattern = ""
         for character in text {
             switch character {
@@ -254,7 +268,7 @@ struct FuzzyPattern: Sendable {
 
     init(_ needle: String, ignoreCase: Bool) {
         self.ignoreCase = ignoreCase
-        self.needle = Array((ignoreCase ? needle.lowercased() : needle).utf16)
+        self.needle = ignoreCase ? Self.caseFolded(Array(needle.utf16)) : Array(needle.utf16)
         // Short words tolerate nothing, or every three-letter word would match half the disk.
         maxEdits = switch self.needle.count {
         case ..<4: 0
@@ -263,10 +277,25 @@ struct FuzzyPattern: Sendable {
         }
     }
 
+    /// Lowercases one UTF-16 unit at a time, leaving any unit whose lowercase form is longer as it
+    /// is. `String.lowercased()` would turn "İ" into two units, shifting every offset after it and
+    /// putting the highlight — and the snippet range — past the end of the text.
+    static func caseFolded(_ units: [UInt16]) -> [UInt16] {
+        units.map { unit in
+            if unit < 0x80 {
+                return (0x41...0x5A).contains(unit) ? unit + 0x20 : unit
+            }
+            guard let scalar = Unicode.Scalar(unit) else { return unit }
+            let lower = String(scalar).lowercased().utf16
+            return lower.count == 1 ? lower.first! : unit
+        }
+    }
+
     func find(in text: String) -> NSRange? {
-        let haystack = Array((ignoreCase ? text.lowercased() : text).utf16)
+        let haystack = ignoreCase ? Self.caseFolded(Array(text.utf16)) : Array(text.utf16)
         let m = needle.count
         guard m > 0 else { return nil }
+        var best: (end: Int, cost: Int)?
         var beforePrevious = Array(0...m)
         var previous = Array(0...m)
         var current = [Int](repeating: 0, count: m + 1)
@@ -279,12 +308,17 @@ struct FuzzyPattern: Sendable {
                     current[i] = min(current[i], beforePrevious[i - 2] + 1)
                 }
             }
-            if current[m] <= maxEdits {
-                let start = max(0, j - m + 1)
-                return NSRange(location: start, length: j - start + 1)
+            // Keep going while the match keeps getting closer, so "invoice" ends on its "e" rather
+            // than one letter early at "invoic", which already fits within one edit.
+            if current[m] <= maxEdits, current[m] < (best?.cost ?? .max) {
+                best = (j, current[m])
+            } else if best != nil {
+                break
             }
             (beforePrevious, previous, current) = (previous, current, beforePrevious)
         }
-        return nil
+        guard let best else { return nil }
+        let start = max(0, best.end - m + 1)
+        return NSRange(location: start, length: best.end - start + 1)
     }
 }

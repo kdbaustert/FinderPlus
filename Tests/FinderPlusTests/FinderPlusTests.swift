@@ -318,8 +318,14 @@ final class SearchModelTests: XCTestCase {
 
         model.query = "invoice"
         model.start()
-        // Before the new walk reports anything, the table has already narrowed rather than emptied.
-        XCTAssertEqual(model.results.map(\.name), ["invoice-april.txt", "invoice-march.txt"])
+        // The table narrows instead of emptying and refilling: sampled throughout the search, it
+        // is never blank.
+        var sawEmpty = false
+        for _ in 0..<500 where model.isSearching {
+            if model.results.isEmpty { sawEmpty = true }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        XCTAssertFalse(sawEmpty)
         try await finish(model)
         XCTAssertEqual(model.results.map(\.name), ["invoice-april.txt", "invoice-march.txt"])
     }
@@ -386,5 +392,203 @@ final class FullDiskAccessTests: XCTestCase {
         XCTAssertTrue(SearchModel.hasFullDiskAccess(probing: [missing, readable]))
         XCTAssertFalse(SearchModel.hasFullDiskAccess(probing: [missing, locked, readable]))
         XCTAssertTrue(SearchModel.hasFullDiskAccess(probing: [missing]), "nothing to test: never nag")
+    }
+}
+
+final class AuditFixTests: XCTestCase {
+    private var root: URL!
+
+    override func setUpWithError() throws {
+        root = FileManager.default.temporaryDirectory.appending(path: "FinderPlusAudit-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    private func write(_ name: String, _ text: String = "x") throws -> URL {
+        let url = root.appending(path: name)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try text.write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
+
+    private func walk(
+        _ query: String, _ configure: (inout SearchOptions) -> Void = { _ in },
+        isStopped: @escaping @Sendable () -> Bool = { false }
+    ) throws -> [FileHit] {
+        var options = SearchOptions()
+        configure(&options)
+        let request = try SearchRequest(roots: [root], query: query, options: options)
+        var hits: [FileHit] = []
+        SearchEngine.walk(request, isStopped: isStopped) { event in
+            if case .hits(let batch) = event { hits += batch }
+        }
+        return hits.sorted { $0.name < $1.name }
+    }
+
+    // Audit 2: lowercasing "İ" doubled its length and pushed the match past the end of the text.
+    func testFuzzyWithDottedCapitalIDoesNotCrashOrMisplaceTheMatch() throws {
+        var options = SearchOptions()
+        options.fuzzy = true
+        options.ignoreDiacritics = false
+        let matcher = try QueryMatcher(query: "invoice", options: options)
+        let text = "İİİİ the invoice"
+        let snippet = try XCTUnwrap(matcher.snippet(in: text))
+        XCTAssertLessThanOrEqual(NSMaxRange(snippet.match), (snippet.text as NSString).length)
+        XCTAssertEqual((snippet.text as NSString).substring(with: snippet.match), "invoice")
+    }
+
+    // Audit 2: an exact fuzzy match used to highlight one character early (" invoic").
+    func testFuzzyHighlightsTheWholeExactWord() throws {
+        var options = SearchOptions()
+        options.fuzzy = true
+        let snippet = try XCTUnwrap(try QueryMatcher(query: "invoice", options: options).snippet(in: "an invoice here"))
+        XCTAssertEqual((snippet.text as NSString).substring(with: snippet.match), "invoice")
+    }
+
+    // Audit 3: `.*\.pdf` on one 100,000-character line took 48 seconds.
+    func testContentWildcardOnALongLineIsFast() throws {
+        var options = SearchOptions()
+        options.mode = .wildcards
+        let matcher = try QueryMatcher(query: "*.pdf", options: options, anchorsWildcards: false)
+        let line = String(repeating: "a", count: 200_000)
+        let started = ContinuousClock.now
+        XCTAssertFalse(matcher.matches(line))
+        XCTAssertTrue(matcher.matches(line + " report.pdf"))
+        XCTAssertLessThan(started.duration(to: .now), .seconds(1))
+        XCTAssertEqual(QueryMatcher.wildcardPattern("*.pdf*", anchored: false), "\\.pdf")
+        XCTAssertEqual(QueryMatcher.wildcardPattern("*.pdf", anchored: true), "^.*\\.pdf$")
+    }
+
+    // Audit 3: Stop now reaches the walk and its content workers.
+    func testAStoppedWalkReportsNothing() throws {
+        for index in 0..<50 { _ = try write("file\(index).txt", "needle") }
+        let hits = try walk("needle", { $0.searchNames = false; $0.searchContents = true }, isStopped: { true })
+        XCTAssertEqual(hits, [])
+    }
+
+    // Audit 10: a query of exclusions alone now says why instead of clearing the results.
+    func testExclusionsOnlyQueryExplainsItself() {
+        XCTAssertThrowsError(try QueryMatcher(query: "-draft", options: SearchOptions())) { error in
+            guard case QueryError.onlyExclusions = error else { return XCTFail("\(error)") }
+        }
+    }
+
+    // Audit 11: another user whose name starts with this one's must not become "~b/…".
+    func testDisplayParentOnlyAbbreviatesTheRealHome() {
+        let sibling = FileHit(
+            url: URL(filePath: NSHomeDirectory() + "b/Documents/x.txt"), name: "x.txt", isFolder: false,
+            size: 1, modified: .now, kind: "Text")
+        XCTAssertFalse(sibling.displayParent.hasPrefix("~"))
+        let own = FileHit(
+            url: URL(filePath: NSHomeDirectory() + "/Documents/x.txt"), name: "x.txt", isFolder: false,
+            size: 1, modified: .now, kind: "Text")
+        XCTAssertEqual(own.displayParent, "~/Documents")
+    }
+
+    // Audit 9: a folder that is gone is named as missing, not blamed on Full Disk Access.
+    func testMissingFolderIsReportedAsMissing() async {
+        do {
+            _ = try await SearchModel.resolveRoots(for: .folder(root.appending(path: "gone").path))
+            XCTFail("expected an error")
+        } catch LocationError.missingFolder {
+        } catch {
+            XCTFail("\(error)")
+        }
+    }
+
+    func testDateSizeAndKindFilters() throws {
+        let old = try write("old-report.txt")
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date.now.addingTimeInterval(-40 * 86_400)], ofItemAtPath: old.path)
+        _ = try write("new-report.txt")
+        _ = try write("report-photo.png")
+        _ = try write("big-report.txt", String(repeating: "x", count: 1_200_000))
+
+        XCTAssertEqual(try walk("report") { $0.modified = .month }.map(\.name),
+                       ["big-report.txt", "new-report.txt", "report-photo.png"])
+        XCTAssertEqual(try walk("report") { $0.size = .over1MB }.map(\.name), ["big-report.txt"])
+        XCTAssertEqual(try walk("report") { $0.size = .under1MB; $0.excludedKinds = [.images] }.map(\.name),
+                       ["new-report.txt", "old-report.txt"])
+        XCTAssertTrue(try walk("new-report").allSatisfy { $0.created > .distantPast })
+    }
+
+    func testZipEntriesAreListedWhenAsked() throws {
+        _ = try write("src/Reports/invoice-march.pdf")
+        _ = try write("src/notes.txt")
+        let zip = Process()
+        zip.executableURL = URL(filePath: "/usr/bin/zip")
+        zip.currentDirectoryURL = root
+        zip.arguments = ["-qr", "bundle.zip", "src"]
+        try zip.run()
+        zip.waitUntilExit()
+        try FileManager.default.removeItem(at: root.appending(path: "src"))
+
+        XCTAssertEqual(try walk("invoice"), [])
+        let hits = try walk("invoice") { $0.includeArchiveContents = true }
+        XCTAssertEqual(hits.map(\.name), ["invoice-march.pdf"])
+        let entry = try XCTUnwrap(hits.first)
+        XCTAssertTrue(entry.isArchiveEntry)
+        XCTAssertEqual(entry.url.lastPathComponent, "bundle.zip")
+        XCTAssertTrue(entry.fullPath.hasSuffix("bundle.zip/src/Reports/invoice-march.pdf"))
+        XCTAssertNotEqual(entry.id, entry.url.path)
+        XCTAssertEqual(try walk("reports") { $0.includeArchiveContents = true; $0.kind = .folders }.map(\.name),
+                       ["Reports"])
+    }
+}
+
+@MainActor
+final class AuditModelTests: XCTestCase {
+    private var root: URL!
+    private var defaults: UserDefaults!
+
+    override func setUp() async throws {
+        root = FileManager.default.temporaryDirectory.appending(path: "FinderPlusAuditModel-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        for name in ["invoice-march.txt", "notes.md", "notes-old.md"] {
+            try "x".write(to: root.appending(path: name), atomically: true, encoding: .utf8)
+        }
+        defaults = UserDefaults(suiteName: "FinderPlusAudit-\(UUID().uuidString)")
+    }
+
+    override func tearDown() async throws {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    private func finish(_ model: SearchModel) async throws {
+        for _ in 0..<300 where model.isSearching { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertFalse(model.isSearching)
+    }
+
+    // Audit 1: a replaced search's events must not land in the new results.
+    func testAReplacedSearchLeavesNothingBehind() async throws {
+        let model = SearchModel(defaults: defaults)
+        model.locationID = root.path
+        model.query = "invoice"
+        model.start()
+        model.query = "notes"
+        model.start()
+        try await finish(model)
+        XCTAssertEqual(model.results.map(\.name).sorted(), ["notes-old.md", "notes.md"])
+    }
+
+    // Audit 10: Return runs the same checks as the Find button.
+    func testNothingTickedExplainsInsteadOfWalking() {
+        let model = SearchModel(defaults: defaults)
+        model.locationID = root.path
+        model.query = "notes"
+        model.options.searchNames = false
+        model.start()
+        guard case .failed = model.phase else { return XCTFail("\(model.phase)") }
+    }
+
+    func testSortOrderIsRemembered() {
+        let first = SearchModel(defaults: defaults)
+        first.sortOrder = [KeyPathComparator(\FileHit.size, order: .reverse)]
+        let second = SearchModel(defaults: defaults)
+        XCTAssertEqual(second.sortOrder.first?.keyPath, \FileHit.size as AnyKeyPath)
+        XCTAssertEqual(second.sortOrder.first?.order, .reverse)
     }
 }

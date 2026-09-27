@@ -111,15 +111,25 @@ extension SearchLocation: Codable {
 
 enum LocationError: LocalizedError {
     case noRemovableVolumes
-    case finderUnavailable(String)
+    case missingFolder(String)
+    case finderAccessDenied
+    case finderNotAFolder
+    case finderTimedOut
 
     var errorDescription: String? {
         switch self {
         case .noRemovableVolumes:
             "No removable volumes are connected."
-        case .finderUnavailable(let reason):
-            "Couldn’t read the front Finder window (\(reason)). Allow FinderPlus to control Finder in "
-                + "System Settings › Privacy & Security › Automation."
+        case .missingFolder(let name):
+            "“\(name)” isn’t available. Its drive may be disconnected, or the folder may have been moved or deleted."
+        case .finderAccessDenied:
+            "FinderPlus isn’t allowed to ask Finder which folder it’s showing. Allow it in System Settings › "
+                + "Privacy & Security › Automation."
+        case .finderNotAFolder:
+            "The front Finder window isn’t showing a folder. Recents, AirDrop and search windows have no "
+                + "location to search."
+        case .finderTimedOut:
+            "Finder didn’t answer. Try again once it’s responding."
         }
     }
 }
@@ -137,6 +147,7 @@ final class SearchModel {
         static let location = "location"
         static let recents = "recentQueries"
         static let settings = "settings"
+        static let sort = "sortOrder"
     }
 
     var query = ""
@@ -147,8 +158,11 @@ final class SearchModel {
     var settings: AppSettings { didSet { save(settings, Key.settings) } }
 
     var results: [FileHit] = []
-    var selection: Set<URL> = []
-    var sortOrder = [KeyPathComparator(\FileHit.name, comparator: .localizedStandard)]
+    var selection: Set<FileHit.ID> = []
+    var sortOrder: [KeyPathComparator<FileHit>] { didSet { saveSortOrder() } }
+    /// True while the search field is being typed in, so ⌘⌫ deletes text there instead of
+    /// moving the selected results to the Trash.
+    var isEditingQuery = false
     var previewURL: URL?
     /// Bumped by ⌘F; the search field focuses itself when it changes.
     var focusRequest = 0
@@ -173,11 +187,15 @@ final class SearchModel {
     /// refining them.
     @ObservationIgnored private var lastRun: Run?
     /// IDs already in `results`, so a hit carried over from the previous run is not added twice.
-    @ObservationIgnored private var knownIDs: Set<URL> = []
+    @ObservationIgnored private var knownIDs: Set<FileHit.ID> = []
 
+    /// What decides whether the rows on screen would all be found again: the folders actually
+    /// walked (so a different front Finder window or an ejected drive counts as a change), the
+    /// options, and the limits from Settings.
     private struct Run: Equatable {
+        let roots: [String]
         let options: SearchOptions
-        let locationID: String
+        let limits: SearchLimits
     }
 
     init(defaults: UserDefaults = .standard) {
@@ -187,6 +205,7 @@ final class SearchModel {
         locationID = Self.load(String.self, Key.location, defaults) ?? NSHomeDirectory()
         recentQueries = Self.load([String].self, Key.recents, defaults) ?? []
         settings = Self.load(AppSettings.self, Key.settings, defaults) ?? AppSettings()
+        sortOrder = [Self.comparator(for: Self.load(SavedSort.self, Key.sort, defaults) ?? SavedSort())]
     }
 
     var isSearching: Bool { phase == .searching }
@@ -202,12 +221,17 @@ final class SearchModel {
     /// heavy to begin speculatively.
     func start() {
         searchTask?.cancel()
-        let request: SearchRequest
-        do {
-            request = try SearchRequest(roots: searchRoots(), query: query, options: options, limits: settings.limits)
-        } catch QueryError.empty {
+        // The same checks that disable the Find button, so Return cannot get around them.
+        guard options.searchesAnyField else {
             results = []
-            phase = .idle
+            phase = .failed("Choose what to search — Name, Contents, Tags or Comments — under Search for.")
+            return
+        }
+        // The query is checked before the location is resolved, so an empty or invalid one never
+        // asks Finder anything.
+        do {
+            _ = try QueryMatcher(query: query, options: options)
+        } catch QueryError.empty {
             return
         } catch {
             results = []
@@ -216,19 +240,6 @@ final class SearchModel {
         }
 
         remember(query)
-        let run = Run(options: options, locationID: locationID)
-        let refinesLast = lastRun == run
-        lastRun = run
-        if refinesLast && options.searchNames {
-            // A new query in the same place with the same options narrows what is on screen
-            // instead of blanking it while the walk starts over. What stays still matches by name,
-            // so the new walk would report it anyway.
-            results.removeAll { !request.nameMatcher.matches($0.name) }
-        } else {
-            results = []
-        }
-        knownIDs = Set(results.map(\.id))
-        selection.formIntersection(knownIDs)
         scanned = 0
         unreadable = 0
         reachedLimit = false
@@ -236,14 +247,48 @@ final class SearchModel {
         searchedContents = options.searchContents
         phase = .searching
 
+        let (query, options, limits, location) = (query, options, settings.limits, location)
         let started = ContinuousClock.now
         searchTask = Task { [weak self] in
-            for await event in SearchEngine.run(request) {
-                self?.apply(event)
+            let request: SearchRequest
+            do {
+                let roots = try await Self.resolveRoots(for: location)
+                request = try SearchRequest(roots: roots, query: query, options: options, limits: limits)
+            } catch {
+                guard !Task.isCancelled else { return }
+                self?.results = []
+                self?.phase = .failed(error.localizedDescription)
+                return
             }
             guard !Task.isCancelled, let self else { return }
+            prepareResults(for: request)
+            for await event in SearchEngine.run(request) {
+                // Events already buffered when this search was stopped or replaced must not reach
+                // the next search's results.
+                guard !Task.isCancelled else { break }
+                apply(event)
+            }
+            guard !Task.isCancelled else { return }
             phase = .finished(started.duration(to: .now))
         }
+    }
+
+    /// Narrows the rows on screen when the new walk is certain to report them again; otherwise
+    /// clears them. Content searches never keep rows — a kept row would keep the old query's
+    /// snippet — and neither do searches with a match limit, which kept rows could push past.
+    private func prepareResults(for request: SearchRequest) {
+        let run = Run(roots: request.roots.map(\.path), options: request.options, limits: request.limits)
+        let refinesLast = lastRun == run
+        lastRun = run
+        if refinesLast, run.options.searchNames, !run.options.searchContents, run.limits.maxResults == 0 {
+            results.removeAll {
+                !request.nameMatcher.matches($0.name) || !FileManager.default.fileExists(atPath: $0.url.path)
+            }
+        } else {
+            results = []
+        }
+        knownIDs = Set(results.map(\.id))
+        selection.formIntersection(knownIDs)
     }
 
     func stop() {
@@ -257,25 +302,61 @@ final class SearchModel {
         results.sort(by: precedes)
     }
 
+    // MARK: - Sort order
+
+    /// The column and direction to restore at launch. `KeyPathComparator` is not Codable, so the
+    /// first comparator is saved by the column it sorts.
+    private struct SavedSort: Codable {
+        enum Column: String, Codable { case name, location, match, kind, size, modified, created }
+        var column = Column.name
+        var ascending = true
+    }
+
+    private static func comparator(for saved: SavedSort) -> KeyPathComparator<FileHit> {
+        let order: SortOrder = saved.ascending ? .forward : .reverse
+        return switch saved.column {
+        case .name: KeyPathComparator(\FileHit.name, order: order)
+        case .location: KeyPathComparator(\FileHit.parentPath, order: order)
+        case .match: KeyPathComparator(\FileHit.snippetText, order: order)
+        case .kind: KeyPathComparator(\FileHit.kind, order: order)
+        case .size: KeyPathComparator(\FileHit.size, order: order)
+        case .modified: KeyPathComparator(\FileHit.modified, order: order)
+        case .created: KeyPathComparator(\FileHit.created, order: order)
+        }
+    }
+
+    private func saveSortOrder() {
+        guard let first = sortOrder.first else { return }
+        let columns: [(AnyKeyPath, SavedSort.Column)] = [
+            (\FileHit.name, .name), (\FileHit.parentPath, .location), (\FileHit.snippetText, .match),
+            (\FileHit.kind, .kind), (\FileHit.size, .size), (\FileHit.modified, .modified),
+            (\FileHit.created, .created),
+        ]
+        guard let column = columns.first(where: { $0.0 == first.keyPath })?.1 else { return }
+        save(SavedSort(column: column, ascending: first.order == .forward), Key.sort)
+    }
+
     /// Merges a batch into the already-sorted results, so rows land in place as they are found
-    /// rather than piling up at the bottom and jumping when the search ends.
+    /// rather than piling up at the bottom and jumping when the search ends. Each new row's place
+    /// is found by binary search: comparing it against every row on screen instead fell behind the
+    /// walk at around 200,000 results.
     private func insertSorted(_ hits: [FileHit]) {
         let batch = hits.filter { knownIDs.insert($0.id).inserted }.sorted(by: precedes)
         guard !batch.isEmpty else { return }
         var merged: [FileHit] = []
         merged.reserveCapacity(results.count + batch.count)
-        var i = 0, j = 0
-        while i < results.count, j < batch.count {
-            if precedes(batch[j], results[i]) {
-                merged.append(batch[j])
-                j += 1
-            } else {
-                merged.append(results[i])
-                i += 1
+        var copied = 0
+        for hit in batch {
+            var low = copied, high = results.count
+            while low < high {
+                let middle = (low + high) / 2
+                if precedes(hit, results[middle]) { high = middle } else { low = middle + 1 }
             }
+            merged += results[copied..<low]
+            merged.append(hit)
+            copied = low
         }
-        merged += results[i...]
-        merged += batch[j...]
+        merged += results[copied...]
         results = merged
     }
 
@@ -303,27 +384,32 @@ final class SearchModel {
         }
     }
 
-    func searchRoots() throws -> [URL] {
+    /// The folders a search walks. Async because the front Finder window has to be asked for, which
+    /// happens off the main thread with a time limit.
+    nonisolated static func resolveRoots(for location: SearchLocation) async throws -> [URL] {
         switch location {
         case .allVolumes:
-            return Self.volumes { _ in true }
+            return volumes { _ in true }
         case .localVolumes:
-            return Self.volumes { $0.volumeIsLocal ?? true }
+            return volumes { $0.volumeIsLocal ?? true }
         case .removableVolumes:
             // USB drives usually report ejectable rather than removable; either counts.
-            let roots = Self.volumes { ($0.volumeIsRemovable ?? false) || ($0.volumeIsEjectable ?? false) }
+            let roots = volumes { ($0.volumeIsRemovable ?? false) || ($0.volumeIsEjectable ?? false) }
             guard !roots.isEmpty else { throw LocationError.noRemovableVolumes }
             return roots
         case .activeFinderWindow:
-            return [try Self.frontFinderFolder()]
+            return [try await frontFinderFolder()]
         case .folder(let path):
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue
+            else { throw LocationError.missingFolder(location.title) }
             return [URL(filePath: path, directoryHint: .isDirectory)]
         }
     }
 
     /// `/` is among the mounted volumes; the walk skips `/Volumes`, so each other volume is walked
     /// once, from its own root.
-    private static func volumes(where include: (URLResourceValues) -> Bool) -> [URL] {
+    nonisolated private static func volumes(where include: (URLResourceValues) -> Bool) -> [URL] {
         let keys: Set<URLResourceKey> = [.volumeIsLocalKey, .volumeIsRemovableKey, .volumeIsEjectableKey]
         let urls = FileManager.default.mountedVolumeURLs(
             includingResourceValuesForKeys: Array(keys), options: [.skipHiddenVolumes]) ?? []
@@ -331,19 +417,47 @@ final class SearchModel {
     }
 
     /// Resolved when the search starts, like EasyFind. Finder with no windows open means the
-    /// Desktop, which is what Finder itself shows then.
-    private static func frontFinderFolder() throws -> URL {
-        let source = """
+    /// Desktop, which is what Finder itself shows then. `osascript` on a background queue rather
+    /// than `NSAppleScript` on the main thread: a busy Finder, or a permission prompt left
+    /// unanswered, used to freeze the whole window for AppleScript's two-minute default.
+    nonisolated private static func frontFinderFolder() async throws -> URL {
+        let script = """
             tell application "Finder"
                 if (count of Finder windows) is 0 then return POSIX path of (desktop as alias)
                 return POSIX path of (target of front Finder window as alias)
             end tell
             """
-        var error: NSDictionary?
-        let result = NSAppleScript(source: source)?.executeAndReturnError(&error)
-        guard let path = result?.stringValue else {
-            let reason = error?[NSAppleScript.errorMessage] as? String ?? "no answer"
-            throw LocationError.finderUnavailable(reason)
+        let path: String = try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                process.executableURL = URL(filePath: "/usr/bin/osascript")
+                process.arguments = ["-e", script]
+                let output = Pipe()
+                let errors = Pipe()
+                process.standardOutput = output
+                process.standardError = errors
+                do { try process.run() } catch {
+                    continuation.resume(throwing: LocationError.finderTimedOut)
+                    return
+                }
+                let deadline = Date.now.addingTimeInterval(8)
+                while process.isRunning, Date.now < deadline { usleep(50_000) }
+                if process.isRunning {
+                    process.terminate()
+                    continuation.resume(throwing: LocationError.finderTimedOut)
+                    return
+                }
+                let answer = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                let problem = String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                if process.terminationStatus == 0 {
+                    continuation.resume(returning: answer.trimmingCharacters(in: .whitespacesAndNewlines))
+                } else if problem.contains("-1743") {
+                    // errAEEventNotPermitted: the Automation permission is off.
+                    continuation.resume(throwing: LocationError.finderAccessDenied)
+                } else {
+                    continuation.resume(throwing: LocationError.finderNotAFolder)
+                }
+            }
         }
         return URL(filePath: path, directoryHint: .isDirectory)
     }
@@ -376,15 +490,21 @@ final class SearchModel {
 
     // MARK: - File actions
 
-    /// Result URLs for `ids`, or for the selection, in display order.
-    func targets(_ ids: Set<URL>?) -> [URL] {
+    /// The rows for `ids`, or for the selection, in display order.
+    func hits(_ ids: Set<FileHit.ID>?) -> [FileHit] {
         let ids = ids ?? selection
         guard !ids.isEmpty else { return [] }
-        return results.lazy.map(\.url).filter(ids.contains)
+        return results.filter { ids.contains($0.id) }
+    }
+
+    /// The files behind those rows, each once: a file inside an archive stands for its archive.
+    func targets(_ ids: Set<FileHit.ID>?) -> [URL] {
+        var seen = Set<URL>()
+        return hits(ids).map(\.url).filter { seen.insert($0).inserted }
     }
 
     /// Double-clicking a result, as chosen in Settings.
-    func performDefaultAction(_ ids: Set<URL>) {
+    func performDefaultAction(_ ids: Set<FileHit.ID>) {
         switch settings.doubleClick {
         case .open: open(ids)
         case .reveal: reveal(ids)
@@ -392,27 +512,33 @@ final class SearchModel {
         }
     }
 
-    func open(_ ids: Set<URL>? = nil) {
+    func open(_ ids: Set<FileHit.ID>? = nil) {
         for url in targets(ids) { NSWorkspace.shared.open(url) }
     }
 
-    func reveal(_ ids: Set<URL>? = nil) {
+    func reveal(_ ids: Set<FileHit.ID>? = nil) {
         NSWorkspace.shared.activateFileViewerSelecting(targets(ids))
     }
 
-    func copyPaths(_ ids: Set<URL>? = nil) {
+    func copyPaths(_ ids: Set<FileHit.ID>? = nil) {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
-        pasteboard.setString(targets(ids).map(\.path).joined(separator: "\n"), forType: .string)
+        pasteboard.setString(hits(ids).map(\.fullPath).joined(separator: "\n"), forType: .string)
     }
 
     func toggleQuickLook() {
         previewURL = previewURL == nil ? targets(nil).first : nil
     }
 
-    func trash(_ ids: Set<URL>? = nil) async {
-        let urls = targets(ids)
-        guard !urls.isEmpty else { return }
+    func trash(_ ids: Set<FileHit.ID>? = nil) async {
+        // Only files on disk: a file inside an archive cannot be trashed on its own, and trashing
+        // the archive because one entry was selected would take everything else in it too.
+        var seen = Set<URL>()
+        let urls = hits(ids).filter { !$0.isArchiveEntry }.map(\.url).filter { seen.insert($0).inserted }
+        guard !urls.isEmpty else {
+            NSSound.beep()
+            return
+        }
         if settings.confirmTrash {
             let alert = NSAlert()
             alert.messageText = "Move \(Self.describe(urls)) to the Trash?"
@@ -423,7 +549,9 @@ final class SearchModel {
         }
         let outcome = await Self.recycle(urls)
         results.removeAll { outcome.trashed.contains($0.url) }
-        selection.subtract(outcome.trashed)
+        let remaining = Set(results.map(\.id))
+        selection.formIntersection(remaining)
+        knownIDs.formIntersection(remaining)
 
         let refused = urls.filter { !outcome.trashed.contains($0) }
         guard !refused.isEmpty else { return }
