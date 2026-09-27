@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>FinderPlus</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>dev.kennyb.FinderPlus</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>FinderPlus</string>
+	<key>CFBundleDisplayName</key>
+	<string>FinderPlus</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>26.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>FinderPlus searches your Desktop when it is one of the locations you choose.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>FinderPlus searches your Documents folder when it is one of the locations you choose.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>FinderPlus searches your Downloads folder when it is one of the locations you choose.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>FinderPlus searches removable drives when you search all volumes.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>FinderPlus asks Finder which folder its front window shows, so you can search the Active Finder Window.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>FinderPlus searches network volumes when you search all volumes.</string>
+</dict>
+</plist>

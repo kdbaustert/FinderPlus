@@ -1,0 +1,37 @@
+# macOS
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+Icon
+
+# Build output
+/build
+/.build
+/.swiftpm
+DerivedData/
+*.app
+*.dSYM
+*.dSYM.zip
+*.o
+*.swiftmodule
+*.profraw
+*.profdata
+
+# Xcode user state
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+*.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs and scratch
+*.log
+*.tmp
