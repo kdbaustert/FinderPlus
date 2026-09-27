@@ -1,0 +1,100 @@
+name: Release
+
+# Pushing a tag publishes that version. `v1.2.0` is a stable release, reaching everyone; a tag with a
+# hyphen, like `v1.3.0-beta.1`, is a beta — a GitHub pre-release on Sparkle's beta channel, offered
+# only to copies with "Receive beta updates" on. Both run release.sh, the same script as a release
+# made from a Mac, so there is one way to release rather than two that drift apart.
+on:
+  push:
+    tags: ['v*']
+  # Re-runs a release for a tag that already exists, if a run failed partway.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release (e.g. v1.2.0)'
+        required: true
+
+# Two releases at once would race on the update feed, and one would lose its entry.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    # The OS the app requires, since it uses macOS 26 APIs throughout.
+    runs-on: macos-26
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          # The build number is the commit count, which needs the whole history.
+          fetch-depth: 0
+
+      - name: Version from the tag
+        id: version
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          # Sparkle offers an update only when its build number is higher, across betas and stable
+          # alike. The commit count only ever grows, so no one has to keep track of it.
+          BUILD="$(git rev-list --count HEAD)"
+          BETA=0
+          [[ "$VERSION" == *-* ]] && BETA=1
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "beta=$BETA" >> "$GITHUB_OUTPUT"
+          echo "Releasing $VERSION (build $BUILD, $([[ $BETA == 1 ]] && echo beta || echo stable))"
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      # The key that signs each update. Its public half is SUPublicEDKey in Info.plist; if the two
+      # ever differ, every installed copy silently refuses every update — so that is checked here,
+      # before anything is built or published.
+      - name: Import the Sparkle signing key
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SPARKLE_PRIVATE_KEY" ]]; then
+            echo "::error::The SPARKLE_PRIVATE_KEY secret is not set for this repository."
+            exit 1
+          fi
+          swift package resolve
+          GENERATE_KEYS="$(find .build/artifacts -type f -name generate_keys -perm -u+x -print -quit)"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" > "$RUNNER_TEMP/sparkle_key"
+          "$GENERATE_KEYS" -f "$RUNNER_TEMP/sparkle_key"
+          rm -f "$RUNNER_TEMP/sparkle_key"
+          EXPECTED="$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' Resources/Info.plist)"
+          ACTUAL="$("$GENERATE_KEYS" -p)"
+          if [[ "$EXPECTED" != "$ACTUAL" ]]; then
+            echo "::error::SPARKLE_PRIVATE_KEY does not match SUPublicEDKey in Info.plist."
+            echo "  Info.plist: $EXPECTED"
+            echo "  secret:     $ACTUAL"
+            exit 1
+          fi
+
+      - name: Test
+        run: swift test
+
+      - name: Build and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          BUILD: ${{ steps.version.outputs.build }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.version.outputs.beta }}" == "1" ]]; then
+            ./release.sh --beta --publish
+          else
+            ./release.sh --publish
+          fi

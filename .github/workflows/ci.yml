@@ -1,0 +1,67 @@
+name: CI
+
+# Every push and pull request: the test suite, then the app assembled the way build.sh assembles it,
+# so a change that compiles but breaks the bundle (the icon, Sparkle's embedding, signing) is caught
+# before a release depends on it.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push makes the older run's answer irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: macos-26
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      # Keyed on Package.resolved, where Sparkle is pinned: a miss means the pin changed.
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: spm-${{ runner.os }}-${{ hashFiles('Package.resolved') }}
+          restore-keys: spm-${{ runner.os }}-
+
+      - name: Build
+        run: swift build --build-tests
+
+      - name: Test
+        run: swift test --skip-build
+
+      # Ad-hoc signed, since a runner has no identity; nothing launches this copy.
+      - name: Assemble the app
+        run: ./build.sh
+
+      - name: Check the app came out whole
+        run: |
+          set -euo pipefail
+          APP=build/FinderPlus.app
+          for path in \
+            "$APP/Contents/MacOS/FinderPlus" \
+            "$APP/Contents/Info.plist" \
+            "$APP/Contents/Resources/Assets.car" \
+            "$APP/Contents/Frameworks/Sparkle.framework"
+          do
+            [[ -e "$path" ]] || { echo "missing: $path" >&2; exit 1; }
+          done
+          # A local build must never update itself, so it must carry no feed.
+          if /usr/libexec/PlistBuddy -c 'Print :SUFeedURL' "$APP/Contents/Info.plist" >/dev/null 2>&1; then
+            echo "a development build carries SUFeedURL — it would update itself" >&2
+            exit 1
+          fi
+          codesign --verify --deep --strict "$APP"
+          echo "app OK"

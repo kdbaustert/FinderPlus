@@ -53,12 +53,15 @@ if [[ ! "$BUILD" =~ ^[0-9]+$ ]]; then
 fi
 
 if [[ "$PUBLISH" == "1" ]]; then
-    # The release's tag is made from what GitHub has, so unpushed commits would be left out of the
-    # release that is supposed to contain them.
-    git fetch --quiet origin
-    if [[ -n "$(git status --porcelain)" ]] || [[ "$(git rev-parse HEAD)" != "$(git rev-parse '@{u}')" ]]; then
-        echo "==> ERROR: commit and push first — the release is tagged from what GitHub has" >&2
-        exit 1
+    # From a Mac, the release's tag is made from what GitHub has, so unpushed commits would be left
+    # out of the release that is supposed to contain them. On GitHub Actions the tag being released
+    # is already there, and the checkout is that tag rather than a branch with an upstream.
+    if [[ "${GITHUB_ACTIONS:-}" != "true" ]]; then
+        git fetch --quiet origin
+        if [[ -n "$(git status --porcelain)" ]] || [[ "$(git rev-parse HEAD)" != "$(git rev-parse '@{u}')" ]]; then
+            echo "==> ERROR: commit and push first — the release is tagged from what GitHub has" >&2
+            exit 1
+        fi
     fi
     if gh release view "v$VERSION" --repo "$REPO" >/dev/null 2>&1; then
         echo "==> ERROR: release v$VERSION already exists" >&2
