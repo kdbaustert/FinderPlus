@@ -49,6 +49,9 @@ if [[ "${1:-}" == "--install" ]]; then
     pkill -9 -x FinderPlus 2>/dev/null || true
     rm -rf /Applications/FinderPlus.app
     cp -R "$APP" /Applications/FinderPlus.app
+    # Services are read from a cache; without a refresh "Search with FinderPlus" can take until the
+    # next login to appear in Finder's right-click menu.
+    /System/Library/CoreServices/pbs -update
     open /Applications/FinderPlus.app
     echo "==> Launched."
 fi

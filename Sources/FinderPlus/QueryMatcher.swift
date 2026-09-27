@@ -150,6 +150,28 @@ struct QueryMatcher: @unchecked Sendable {
             match: NSRange(location: lead.utf16.count, length: match.utf16.count))
     }
 
+    /// Every place the query's words or patterns occur, for highlighting a whole document in the
+    /// preview. Offsets are in the text as given when accent folding keeps its length, which it
+    /// almost always does; `limit` bounds the work on a huge file.
+    func ranges(in text: String, limit: Int = 500) -> [NSRange] {
+        let subject = subject(for: text)
+        let whole = NSRange(location: 0, length: (subject as NSString).length)
+        var found: [NSRange] = []
+        for pattern in clauses.flatMap(\.required) {
+            switch pattern {
+            case .regex(let regex):
+                regex.enumerateMatches(in: subject, range: whole) { match, _, stop in
+                    if let match, match.range.length > 0 { found.append(match.range) }
+                    if found.count >= limit { stop.pointee = true }
+                }
+            case .fuzzy:
+                if let range = pattern.find(in: subject) { found.append(range) }
+            }
+            if found.count >= limit { break }
+        }
+        return found.sorted { $0.location < $1.location }
+    }
+
     private func subject(for text: String) -> String {
         foldsDiacritics ? Self.fold(text) : text
     }

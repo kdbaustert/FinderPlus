@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import os
 import PDFKit
 import UniformTypeIdentifiers
@@ -172,9 +173,19 @@ enum SearchEngine {
             DispatchQueue.concurrentPerform(iterations: batch.count) { index in
                 guard !isStopped() else { return }
                 var hit = batch[index]
-                guard let text = contentText(of: hit.url, size: hit.size, maxBytes: limits.maxContentBytes),
-                      let snippet = request.textMatcher.snippet(in: text)
-                else { return }
+                // Metadata first: it is a few header bytes, where contents may be a whole document.
+                var snippet: Snippet?
+                if options.searchMetadata, let metadata = DocumentText.metadataText(of: hit.url) {
+                    snippet = request.textMatcher.snippet(in: metadata)
+                }
+                if snippet == nil, options.searchContents,
+                   let text = contentText(
+                       of: hit.url, size: hit.size, maxBytes: limits.maxContentBytes,
+                       recognizeText: options.recognizeText)
+                {
+                    snippet = request.textMatcher.snippet(in: text)
+                }
+                guard let snippet else { return }
                 hit.snippet = snippet
                 let matched = hit
                 found.withLock { $0.append(matched) }
@@ -298,7 +309,7 @@ enum SearchEngine {
                         || (options.searchComments && finderComment(of: url).map(request.textMatcher.matches) == true)
                     {
                         pending.append(makeHit())
-                    } else if options.searchContents && isRegularFile {
+                    } else if options.readsInsideFiles && isRegularFile {
                         candidates.append(makeHit())
                         if candidates.count >= 64 { searchCandidateContents() }
                     }
@@ -359,6 +370,12 @@ enum SearchEngine {
         return (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? String
     }
 
+    /// An iCloud file that is not downloaded: reading it would download it.
+    static func isPlaceholder(_ url: URL) -> Bool {
+        var info = stat()
+        return lstat(url.path, &info) == 0 && info.st_flags & UInt32(SF_DATALESS) != 0
+    }
+
     /// The entry paths in a zip archive, read from its central directory by `zipinfo` — no
     /// extraction. An unreadable or encrypted archive yields nothing.
     static func zipEntries(of archive: URL) -> [String] {
@@ -377,27 +394,42 @@ enum SearchEngine {
 
     /// Plain text, PDF and word-processor documents. Anything else is sniffed: no NUL bytes in the
     /// first 8 KB means it is treated as text, which catches source files with unknown extensions.
-    static func contentText(of url: URL, size: Int64, maxBytes: Int = SearchLimits().maxContentBytes) -> String? {
+    static func contentText(
+        of url: URL, size: Int64, maxBytes: Int = SearchLimits().maxContentBytes, recognizeText: Bool = false
+    ) -> String? {
         guard size > 0, size <= maxBytes else { return nil }
         // An iCloud file that is not downloaded is a placeholder, and reading it downloads it — a
         // content search of iCloud Drive would otherwise pull the whole drive down.
-        var info = stat()
-        if lstat(url.path, &info) == 0, info.st_flags & UInt32(SF_DATALESS) != 0 { return nil }
+        if isPlaceholder(url) { return nil }
         let type = UTType(filenameExtension: url.pathExtension)
 
         if let type, type.conforms(to: .pdf) {
-            return PDFDocument(url: url)?.string
+            guard let document = PDFDocument(url: url) else { return nil }
+            let text = document.string ?? ""
+            // Next to no text across the pages means a scan: pictures of pages, not text.
+            if recognizeText, text.trimmingCharacters(in: .whitespacesAndNewlines).count < 20 * max(document.pageCount, 1) / 10 {
+                return DocumentText.recognizedText(inScannedPDF: document)
+            }
+            return text
+        }
+        if recognizeText, let type, type.conforms(to: .image) {
+            return DocumentText.recognizedText(inImageAt: url)
         }
         if let type, richTextTypes.contains(where: type.conforms(to:)) {
             return try? NSAttributedString(url: url, options: [:], documentAttributes: nil).string
+        }
+        if let members = DocumentText.zipMembers(forExtension: url.pathExtension.lowercased()) {
+            return DocumentText.zipText(of: url, members: members, maxBytes: maxBytes)
         }
         let isText = type?.conforms(to: .text) ?? false
         let isUnknown = type == nil || type?.isDynamic == true
         guard isText || isUnknown else { return nil }
         // A plain read: decoding copies the bytes anyway, and a mapped file whose volume goes
         // away mid-read takes the process down with SIGBUS.
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        return decode(data)
+        guard let data = try? Data(contentsOf: url), let text = decode(data) else { return nil }
+        // Web pages are searched for what they say, not for their tags and scripts.
+        if let type, type.conforms(to: .html) { return DocumentText.markupText(text) }
+        return text
     }
 
     static func decode(_ data: Data) -> String? {
@@ -425,5 +457,50 @@ extension KindGroup {
         case .audio: .audio
         case .archives: .archive
         }
+    }
+}
+
+/// Files with identical contents. Same size first, which costs nothing; then a hash of the first
+/// 64 KB, which is cheap; and a full SHA-256 only for files that match that far — so most files
+/// are never read at all, and big ones only when they might really be copies.
+enum DuplicateFinder {
+    struct Candidate: Sendable {
+        let id: FileHit.ID
+        let url: URL
+        let size: Int64
+    }
+
+    static func sets(in candidates: [Candidate]) -> [[FileHit.ID]] {
+        let headLength = 64 * 1024
+        var sets: [[FileHit.ID]] = []
+        for sameSize in Dictionary(grouping: candidates, by: \.size).values where sameSize.count > 1 {
+            for (head, sameHead) in Dictionary(grouping: sameSize, by: { digest(of: $0.url, limit: headLength) })
+            where head != nil && sameHead.count > 1 {
+                let identical = sameSize[0].size <= Int64(headLength)
+                    ? [head: sameHead]
+                    : Dictionary(grouping: sameHead, by: { digest(of: $0.url, limit: nil) })
+                for (whole, set) in identical where whole != nil && set.count > 1 {
+                    sets.append(set.map(\.id))
+                }
+            }
+        }
+        return sets.sorted { $0.count > $1.count }
+    }
+
+    /// SHA-256 of the first `limit` bytes, or of everything. Nil for a file that cannot be read
+    /// or is an iCloud placeholder, which reading would download.
+    static func digest(of url: URL, limit: Int?) -> String? {
+        if SearchEngine.isPlaceholder(url) { return nil }
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        var read = 0
+        while limit.map({ read < $0 }) ?? true {
+            let chunk = (try? handle.read(upToCount: min(1 << 20, limit.map { $0 - read } ?? 1 << 20))) ?? nil
+            guard let chunk, !chunk.isEmpty else { break }
+            hasher.update(data: chunk)
+            read += chunk.count
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 }

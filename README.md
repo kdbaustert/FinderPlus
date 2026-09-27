@@ -4,23 +4,34 @@
 
 # FinderPlus
 
-A file search app for macOS, in the spirit of EasyFind, with a Liquid Glass interface. It searches
-the disk **live, without Spotlight's index**, so it finds what Spotlight skips: hidden files, system
+A file search app for macOS with a Liquid Glass interface, inspired by
+[EasyFind](https://www.devontechnologies.com/apps/freeware) from DEVONtechnologies. It searches the
+disk **live, without Spotlight's index**, so it finds what Spotlight skips: hidden files, system
 files, and anything that was never indexed. Runs on macOS 26 and later.
 
 > [!NOTE]
 > FinderPlus is at the very beginning of development. Features and behavior may change from one
 > version to the next.
 
+<p align="center">
+  <img src="docs/screenshot.png" alt="FinderPlus searching a folder for “invoice”, with every match marked in the preview beside the results" width="800">
+</p>
+
 ## Features
 
 ### What to search
 
-- File and folder **names**, file **contents**, Finder **tags** and Finder **comments** — any
-  combination; an item matches when any ticked field does.
+- File and folder **names**, file **contents**, Finder **tags**, Finder **comments** and
+  **metadata** — any combination; an item matches when any ticked field does.
 - Files and folders, only files, or only folders.
-- Contents covers plain text and source code, PDF, RTF, Word (`.doc`, `.docx`) and OpenDocument
-  text. Files with unknown extensions are read if they look like text.
+- Contents covers plain text and source code, PDF, RTF, Word, Excel, PowerPoint, OpenDocument
+  (text, spreadsheets and presentations), EPUB books, and web pages without their markup. Files
+  with unknown extensions are read if they look like text.
+- **Text in images:** read the words in photos, screenshots and scanned PDFs, recognised on your
+  Mac.
+- **Metadata:** camera, lens, date taken and dimensions of photos; artist, album, title, genre and
+  year of music; the owner and permissions of any file.
+- **Inside zip archives:** list the files an archive holds, without unpacking it.
 
 ### How to match
 
@@ -35,30 +46,48 @@ files, and anything that was never indexed. Runs on macOS 26 and later.
 ### Where to search
 
 - A folder you choose (⌘L), or the folder shown in the **active Finder window**.
+- **Search with FinderPlus** from any folder's right-click menu in Finder (under Services), or by
+  dropping a folder on the FinderPlus Dock icon.
 - **All volumes**, **local volumes**, **removable volumes**, a single drive, or iCloud Drive.
 - Home, Desktop, Documents, Downloads and Applications, plus any folders you add — drop a folder
   on the options panel to add it.
 - Choose whether to include package contents, invisible files, applications, and system folders
   such as `/System` and `/Library`.
 
+### Narrow it down
+
+- Modified today, in the past 7 or 30 days, or in the past year.
+- Under 1 MB, or over 1 MB, 100 MB or 1 GB.
+- Leave out images, video, audio or archives.
+- Folders that are always skipped, such as `node_modules` or `.git`, set once in Settings.
+
 ### Results
 
-- Results stream in while the search runs, already sorted; sort by name, location, kind, size or
-  date.
-- Each result shows its **location**; content searches show the matching text with the match
-  highlighted.
-- Open, Show in Finder, Quick Look, Copy Path, Share and Move to Trash — from the toolbar, the
-  context menu or the keyboard. Drag results into other apps.
+- Results stream in while the search runs, already sorted; sort by name, location, kind, size,
+  date modified or date created. The sort order is remembered.
+- Each result shows its **location**; content and metadata searches show the matching text.
+- A **preview** beside the results: the file's details, then either its text with every match
+  marked or the usual Quick Look preview.
+- Open, **Open With**, Show in Finder, Quick Look, Copy Path, Share and Move to Trash — from the
+  toolbar, the context menu or the keyboard. Drag results into other apps.
+- **Copy To** and **Move To** another folder, without overwriting anything already there.
+- **Export** the results as a spreadsheet (CSV), or copy the selected rows as a table.
+- **Find duplicates** among the results: files with identical contents, grouped into sets, with the
+  space the extra copies take.
 - A live count of matches and items scanned, and a shortcut to Full Disk Access when some folders
   couldn't be read.
 - Recent searches, one click away in the search field.
 
 ### Interface
 
-- Liquid Glass throughout: a glass toolbar, a floating options panel and results panel over a
-  translucent window.
+- Liquid Glass: a glass toolbar, search field and controls over one even, translucent window.
 - Searches start only when you press **Find** — nothing runs while you type or change options.
 - A new search in the same place narrows the results already on screen instead of blanking them.
+- **Settings:** what double-clicking a result does, asking before moving to the Trash, recent
+  searches, full paths, the largest file to read, a limit on matches, folders to always skip, and
+  whether Full Disk Access is granted.
+- **About FinderPlus** (in the app menu, and as a tab in Settings): the version, who made it, and a
+  link to the project on GitHub.
 
 ## Keyboard shortcuts
 
@@ -75,6 +104,9 @@ files, and anything that was never indexed. Runs on macOS 26 and later.
 | Quick Look | Space or ⌘Y |
 | Copy path | ⌥⌘C |
 | Move to Trash | ⌘⌫ |
+| Show or hide the preview | ⌥⌘P |
+| Export results | ⇧⌘E |
+| Find duplicates in the results | ⇧⌘D |
 
 ## Permissions
 
@@ -83,14 +115,15 @@ reaches your Desktop, Documents or Downloads folder, or a removable or network v
 the **Active Finder Window** asks once for permission to control Finder.
 
 To search everywhere — including other users' folders and protected system locations — grant
-**Full Disk Access** in System Settings → Privacy & Security. The status bar counts the folders a
-search couldn't read and opens that setting when clicked.
+**Full Disk Access** in System Settings → Privacy & Security. When FinderPlus opens without it, it
+explains what stays locked and takes you to that setting; Settings shows whether it is granted, and
+the status bar counts the folders a search couldn't read.
 
 ## Privacy
 
 FinderPlus makes no network requests: no telemetry, analytics, crash reporting or account.
-Everything it reads stays on your Mac. Content searches skip iCloud files that aren't downloaded,
-so searching iCloud Drive never downloads your files.
+Everything it reads stays on your Mac, including text recognised in images. Content searches and
+duplicate checks skip iCloud files that aren't downloaded, so they never download your files.
 
 ## Building
 

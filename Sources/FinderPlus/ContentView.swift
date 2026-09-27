@@ -17,31 +17,36 @@ struct ContentView: View {
                         .frame(width: 244)
                         .overlay(alignment: .trailing) {
                             Rectangle()
-                                .fill(.separator)
+                                .fill(Color.border)
                                 .frame(width: 1)
                         }
                         .transition(.move(edge: .leading).combined(with: .opacity))
                 }
                 // The status sits in its own row under the results. Without a background it cannot
                 // float over them, and the table ignores a safe-area inset, drawing rows beneath it.
+                //
+                // The search bar sits above the results rather than in a bar attached to them: a bar
+                // lets the table's scroll area reach up under it and under the toolbar, and macOS
+                // paints the table's column-header backing across all of that, as a grey block over
+                // the glass.
                 VStack(spacing: 0) {
+                    SearchHeader()
                     ResultsView()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .safeAreaBar(edge: .top) { SearchHeader() }
                     if model.phase != .idle, !isFailed {
                         StatusPill()
                             .transition(.opacity)
                     }
                 }
                 .animation(.spring(duration: 0.35), value: model.phase)
-                // The results side a shade darker than the sidebar, edge to edge from its border.
-                .background(Color.black.opacity(colorScheme == .dark ? 0.14 : 0.04))
+                // The results side darker than the sidebar, edge to edge from its border.
+                .background(Color.black.opacity(colorScheme == .dark ? 0.28 : 0.08))
             }
             // A divider under the toolbar, full width. The sidebar and search area start right at it
             // (their extra breathing room is inside them) so the sidebar's border meets this line.
             .overlay(alignment: .top) {
                 Rectangle()
-                    .fill(.separator)
+                    .fill(Color.border)
                     .frame(height: 1)
             }
         }
@@ -86,6 +91,14 @@ struct ContentView: View {
             action("Move to Trash", symbol: "trash", help: "Move to Trash (⌘⌫)") {
                 Task { await model.trash() }
             }
+        }
+        .sharedBackgroundVisibility(.hidden)
+        ToolbarSpacer(.fixed, placement: .primaryAction)
+        ToolbarItem(placement: .primaryAction) {
+            Button { model.showsPreview.toggle() } label: {
+                Label("Preview", systemImage: "sidebar.right")
+            }
+            .help(model.showsPreview ? "Hide Preview (⌥⌘P)" : "Show Preview (⌥⌘P)")
         }
         .sharedBackgroundVisibility(.hidden)
     }
@@ -170,7 +183,8 @@ struct SearchHeader: View {
                     }
                     .padding(.horizontal, 16)
                     .frame(height: 44)
-                    .glassEffect(.regular.interactive(), in: .capsule)
+                    // A dark tint on the glass, so the field sits a shade deeper than the window.
+                    .glassEffect(.regular.tint(.black.opacity(0.3)).interactive(), in: .capsule)
 
                     if model.isSearching {
                         Button(role: .cancel) { model.stop() } label: {
@@ -266,12 +280,18 @@ struct OptionsPanel: View {
                     .labelsHidden()
                     Divider()
                         .padding(.top, 10)
-                        .padding(.bottom, 2)
+                        .padding(.bottom, 8)
                     Toggle("Name", isOn: $model.options.searchNames)
                     Toggle("Contents", isOn: $model.options.searchContents)
-                        .help("Read inside text files, PDFs and word-processor documents.")
+                        .help("Read inside text, PDF, Word, Excel, PowerPoint, OpenDocument, EPUB and web files.")
+                    Toggle("Text in Images", isOn: $model.options.recognizeText)
+                        .padding(.leading, 20)
+                        .disabled(!model.options.searchContents)
+                        .help("Read the text in photos, screenshots and scanned PDFs. Much slower.")
                     Toggle("Tags", isOn: $model.options.searchTags)
                     Toggle("Comments", isOn: $model.options.searchComments)
+                    Toggle("Metadata", isOn: $model.options.searchMetadata)
+                        .help("Camera, lens and date taken; artist, album and title; owner and permissions.")
                         .help("The comment from Finder’s Get Info window")
                 }
 
@@ -486,18 +506,37 @@ struct ResultsView: View {
         // The table stays mounted and the empty states sit over it. Swapping one for the other
         // rebuilt the scroll view the search bar is attached to, which re-created the search field
         // mid-typing and lost the text in it.
-        table
-            .opacity(model.results.isEmpty ? 0 : 1)
-            .allowsHitTesting(!model.results.isEmpty)
-            .overlay {
-                if model.results.isEmpty { placeholder }
+        HStack(spacing: 0) {
+            VStack(spacing: 0) {
+                if model.showsDuplicates { DuplicatesBanner() }
+                table
+                    .opacity(model.results.isEmpty ? 0 : 1)
+                    .allowsHitTesting(!model.results.isEmpty)
+                    .overlay {
+                        if model.results.isEmpty { placeholder }
+                    }
             }
+            if model.showsPreview {
+                Rectangle().fill(Color.border).frame(width: 1)
+                PreviewPane()
+            }
+        }
         .quickLookPreview($model.previewURL, in: model.selectedURLs)
     }
 
     private var table: some View {
         @Bindable var model = model
         return Table(of: FileHit.self, selection: $model.selection, sortOrder: $model.sortOrder) {
+            // Only in the duplicates view: which set of identical files each row belongs to.
+            if model.showsDuplicates {
+                TableColumn("Set") { hit in
+                    Text(model.duplicateSets[hit.id].map(String.init) ?? "")
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+                .width(min: 30, ideal: 36, max: 50)
+            }
+
             TableColumn("Name", value: \.name) { hit in
                 HStack(spacing: 7) {
                     Image(nsImage: Self.icon(for: hit))
@@ -630,6 +669,30 @@ struct ResultsView: View {
     }
 }
 
+/// Above the results in the duplicates view: what was found, and the way back.
+struct DuplicatesBanner: View {
+    @Environment(SearchModel.self) private var model
+
+    var body: some View {
+        let summary = model.duplicateSummary
+        HStack(spacing: 10) {
+            Image(systemName: "square.on.square")
+                .foregroundStyle(.secondary)
+            Text("\(summary.files.formatted()) duplicate files in \(summary.sets.formatted()) "
+                + (summary.sets == 1 ? "set" : "sets")
+                + " · \(summary.reclaimable.formatted(.byteCount(style: .file))) in extra copies")
+            Spacer()
+            Button("Show All Results") { model.leaveDuplicates() }
+        }
+        .font(.callout)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(Color.border).frame(height: 1)
+        }
+    }
+}
+
 struct ResultMenu: View {
     @Environment(SearchModel.self) private var model
     let ids: Set<FileHit.ID>
@@ -637,12 +700,26 @@ struct ResultMenu: View {
     var body: some View {
         if !ids.isEmpty {
             Button("Open") { model.open(ids) }
+            Menu("Open With") {
+                let applications = model.applications(toOpen: ids)
+                ForEach(applications, id: \.self) { application in
+                    Button(FileManager.default.displayName(atPath: application.path)) {
+                        model.open(ids, with: application)
+                    }
+                }
+                if !applications.isEmpty { Divider() }
+                Button("Other…") { model.chooseApplicationAndOpen(ids) }
+            }
             Button("Show in Finder") { model.reveal(ids) }
             Button("Quick Look") {
                 model.previewURL = model.targets(ids).first
             }
             Divider()
             Button("Copy Path") { model.copyPaths(ids) }
+            Button("Copy Rows") { model.copyRows(ids) }
+            Divider()
+            Button("Copy To…") { Task { await model.transfer(ids, .copy) } }
+            Button("Move To…") { Task { await model.transfer(ids, .move) } }
             Divider()
             Button("Move to Trash", role: .destructive) { Task { await model.trash(ids) } }
         }
@@ -656,30 +733,11 @@ struct StatusPill: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            switch model.phase {
-            case .searching:
+            if model.isFindingDuplicates {
                 ProgressView().controlSize(.small)
-                Text("\(model.results.count.formatted()) matches · \(model.scanned.formatted()) scanned")
-                    .monospacedDigit()
-                    .contentTransition(.numericText())
-                Text(model.currentPath)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .frame(maxWidth: 280, alignment: .leading)
-            case .finished(let duration):
-                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                Text("\(model.results.count.formatted()) matches in \(Self.format(duration)) · \(model.scanned.formatted()) scanned")
-                    .monospacedDigit()
-                if model.reachedLimit {
-                    Text("Stopped at the match limit — change it in Settings")
-                        .foregroundStyle(.secondary)
-                }
-            case .stopped:
-                Image(systemName: "stop.circle.fill").foregroundStyle(.orange)
-                Text("Stopped · \(model.results.count.formatted()) matches")
-            case .idle, .failed:
-                EmptyView()
+                Text("Finding duplicates…")
+            } else {
+                phaseStatus
             }
             if model.unreadable > 0 {
                 Button {
@@ -697,13 +755,51 @@ struct StatusPill: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .overlay(alignment: .top) {
-            Rectangle().fill(.separator).frame(height: 1)
+            Rectangle().fill(Color.border).frame(height: 1)
         }
         .animation(.smooth, value: model.results.count)
+    }
+
+    @ViewBuilder private var phaseStatus: some View {
+        switch model.phase {
+        case .searching:
+            ProgressView().controlSize(.small)
+            Text("\(model.results.count.formatted()) matches · \(model.scanned.formatted()) scanned")
+                .monospacedDigit()
+                .contentTransition(.numericText())
+            Text(model.currentPath)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: 280, alignment: .leading)
+        case .finished(let duration):
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+            Text("\(model.results.count.formatted()) matches in \(Self.format(duration)) · \(model.scanned.formatted()) scanned")
+                .monospacedDigit()
+            if model.reachedLimit {
+                Text("Stopped at the match limit — change it in Settings")
+                    .foregroundStyle(.secondary)
+            }
+        case .stopped:
+            Image(systemName: "stop.circle.fill").foregroundStyle(.orange)
+            Text("Stopped · \(model.results.count.formatted()) matches")
+        case .idle, .failed:
+            EmptyView()
+        }
     }
 
     private static func format(_ duration: Duration) -> String {
         let seconds = Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
         return seconds < 1 ? "\(Int(seconds * 1000)) ms" : String(format: "%.1f s", seconds)
     }
+}
+
+extension Color {
+    /// The window's dividing lines: brighter than the system separator, which all but disappears
+    /// against the darkened glass. Light in dark mode, dark in light mode.
+    static let border = Color(nsColor: NSColor(name: "FinderPlusBorder") { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor.white.withAlphaComponent(0.2)
+            : NSColor.black.withAlphaComponent(0.15)
+    })
 }

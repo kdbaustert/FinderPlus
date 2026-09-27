@@ -1,3 +1,6 @@
+import AppKit
+import ImageIO
+import UniformTypeIdentifiers
 import XCTest
 @testable import FinderPlus
 
@@ -590,5 +593,221 @@ final class AuditModelTests: XCTestCase {
         let second = SearchModel(defaults: defaults)
         XCTAssertEqual(second.sortOrder.first?.keyPath, \FileHit.size as AnyKeyPath)
         XCTAssertEqual(second.sortOrder.first?.order, .reverse)
+    }
+}
+
+final class DocumentTextTests: XCTestCase {
+    private var root: URL!
+
+    override func setUpWithError() throws {
+        root = FileManager.default.temporaryDirectory.appending(path: "FinderPlusDocs-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    /// Builds a zip whose members are the given files, the way Office and EPUB files are made.
+    private func makeZip(_ name: String, _ members: [String: String]) throws -> URL {
+        let staging = root.appending(path: "staging-\(name)")
+        for (path, text) in members {
+            let url = staging.appending(path: path)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try text.write(to: url, atomically: true, encoding: .utf8)
+        }
+        let zip = Process()
+        zip.executableURL = URL(filePath: "/usr/bin/zip")
+        zip.currentDirectoryURL = staging
+        zip.arguments = ["-qr", root.appending(path: name).path, "."]
+        try zip.run()
+        zip.waitUntilExit()
+        return root.appending(path: name)
+    }
+
+    func testMarkupBecomesText() {
+        XCTAssertEqual(
+            DocumentText.markupText("<p>Q3 <b>report</b></p><script>var x = 1</script><a:t>total</a:t> &amp; more"),
+            " Q3 report total & more")
+    }
+
+    func testSpreadsheetPresentationAndEbookText() throws {
+        let xlsx = try makeZip("book.xlsx", [
+            "xl/sharedStrings.xml": "<sst><si><t>Quarterly</t></si><si><t>revenue</t></si></sst>",
+            "xl/worksheets/sheet1.xml": "<sheetData><row><c><v>4242</v></c></row></sheetData>",
+        ])
+        let text = try XCTUnwrap(SearchEngine.contentText(of: xlsx, size: 1))
+        XCTAssertTrue(text.contains("Quarterly revenue"), text)
+        XCTAssertTrue(text.contains("4242"))
+
+        let pptx = try makeZip("deck.pptx", ["ppt/slides/slide1.xml": "<p:sld><a:t>Launch</a:t><a:t>plan</a:t></p:sld>"])
+        XCTAssertTrue(try XCTUnwrap(SearchEngine.contentText(of: pptx, size: 1)).contains("Launch plan"))
+
+        let epub = try makeZip("book.epub", ["OEBPS/chapter1.xhtml": "<html><body><p>Call me Ishmael.</p></body></html>"])
+        XCTAssertTrue(try XCTUnwrap(SearchEngine.contentText(of: epub, size: 1)).contains("Call me Ishmael."))
+    }
+
+    func testHTMLIsSearchedWithoutItsTags() throws {
+        let page = root.appending(path: "page.html")
+        try "<html><head><style>.a{}</style></head><body><h1>Welcome</h1><p>home page</p></body></html>"
+            .write(to: page, atomically: true, encoding: .utf8)
+        let text = try XCTUnwrap(SearchEngine.contentText(of: page, size: 100))
+        XCTAssertTrue(text.contains("Welcome home page"), text)
+        XCTAssertFalse(text.contains("<h1>"))
+    }
+
+    func testTextIsRecognisedInAnImage() throws {
+        let size = NSSize(width: 900, height: 200)
+        let image = NSImage(size: size, flipped: false) { rect in
+            NSColor.white.setFill()
+            rect.fill()
+            ("RECEIPT TOTAL 42" as NSString).draw(
+                at: NSPoint(x: 40, y: 70),
+                withAttributes: [.font: NSFont.systemFont(ofSize: 64, weight: .bold), .foregroundColor: NSColor.black])
+            return true
+        }
+        let png = root.appending(path: "receipt.png")
+        let rep = try XCTUnwrap(NSBitmapImageRep(data: try XCTUnwrap(image.tiffRepresentation)))
+        try XCTUnwrap(rep.representation(using: .png, properties: [:])).write(to: png)
+
+        XCTAssertNil(SearchEngine.contentText(of: png, size: 1000), "images are read only when asked")
+        let text = try XCTUnwrap(SearchEngine.contentText(of: png, size: 1000, recognizeText: true))
+        XCTAssertTrue(text.localizedCaseInsensitiveContains("receipt total"), text)
+    }
+
+    func testPhotoMetadataAndPermissions() throws {
+        let url = root.appending(path: "photo.jpg")
+        let context = CGContext(data: nil, width: 8, height: 8, bitsPerComponent: 8, bytesPerRow: 0,
+                                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(url as CFURL, UTType.jpeg.identifier as CFString, 1, nil))
+        let properties: [CFString: Any] = [
+            kCGImagePropertyTIFFDictionary: [kCGImagePropertyTIFFMake: "Canon", kCGImagePropertyTIFFModel: "EOS R5"],
+            kCGImagePropertyExifDictionary: [kCGImagePropertyExifDateTimeOriginal: "2024:05:01 10:30:00"],
+        ]
+        CGImageDestinationAddImage(destination, try XCTUnwrap(context.makeImage()), properties as CFDictionary)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+        try FileManager.default.setAttributes([.posixPermissions: 0o640], ofItemAtPath: url.path)
+
+        let metadata = try XCTUnwrap(DocumentText.metadataText(of: url))
+        for expected in ["Canon", "EOS R5", "taken 2024-05-01 10:30", "8×8", "rw-r-----", "owner \(NSUserName())"] {
+            XCTAssertTrue(metadata.contains(expected), "\(expected) missing from \(metadata)")
+        }
+        XCTAssertEqual(DocumentText.permissions(0o755), "rwxr-xr-x")
+    }
+
+    func testMetadataSearchFindsPhotosByCamera() throws {
+        let url = root.appending(path: "IMG_0001.jpg")
+        let context = CGContext(data: nil, width: 4, height: 4, bitsPerComponent: 8, bytesPerRow: 0,
+                                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(url as CFURL, UTType.jpeg.identifier as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, try XCTUnwrap(context.makeImage()),
+                                   [kCGImagePropertyTIFFDictionary: [kCGImagePropertyTIFFModel: "EOS R5"]] as CFDictionary)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+
+        var options = SearchOptions()
+        options.searchNames = false
+        options.searchMetadata = true
+        let request = try SearchRequest(roots: [root], query: "eos r5", options: options)
+        var hits: [FileHit] = []
+        SearchEngine.walk(request) { if case .hits(let batch) = $0 { hits += batch } }
+        XCTAssertEqual(hits.map(\.name), ["IMG_0001.jpg"])
+        // With several words, the highlight marks where the first one matched.
+        XCTAssertEqual(hits.first.map { ($0.snippetText as NSString).substring(with: $0.snippet!.match) }, "EOS")
+    }
+}
+
+@MainActor
+final class ResultActionTests: XCTestCase {
+    private var root: URL!
+    private var defaults: UserDefaults!
+
+    override func setUp() async throws {
+        root = FileManager.default.temporaryDirectory.appending(path: "FinderPlusActions-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defaults = UserDefaults(suiteName: "FinderPlusActions-\(UUID().uuidString)")
+    }
+
+    override func tearDown() async throws {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    private func write(_ name: String, _ text: String) throws -> URL {
+        let url = root.appending(path: name)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try text.write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
+
+    private func finish(_ model: SearchModel) async throws {
+        for _ in 0..<300 where model.isSearching || model.isFindingDuplicates {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    func testCSVQuotesOnlyWhatNeedsIt() throws {
+        XCTAssertEqual(SearchModel.csvField("plain"), "plain")
+        XCTAssertEqual(SearchModel.csvField("a, b"), "\"a, b\"")
+        XCTAssertEqual(SearchModel.csvField("say \"hi\""), "\"say \"\"hi\"\"\"")
+
+        let model = SearchModel(defaults: defaults)
+        let hit = FileHit(url: URL(filePath: "/tmp/Q3, final.pdf"), name: "Q3, final.pdf", isFolder: false,
+                          size: 1234, modified: Date(timeIntervalSince1970: 0), kind: "PDF document")
+        let csv = model.resultsCSV([hit])
+        XCTAssertTrue(csv.hasPrefix("\u{FEFF}Name,Location,Kind,Size,Date Modified,Date Created,Match\r\n"))
+        XCTAssertTrue(csv.contains("\"Q3, final.pdf\",/tmp,PDF document,1234,1970-01-01T00:00:00Z,,\r\n"), csv)
+    }
+
+    func testCopyAndMoveNeverOverwrite() throws {
+        let source = try write("in/Report.pdf", "x")
+        let folder = root.appending(path: "out")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        _ = try write("out/Report.pdf", "already here")
+
+        let copied = SearchModel.perform(.copy, [source], into: folder)
+        XCTAssertEqual(copied.done[source]?.lastPathComponent, "Report 2.pdf")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: source.path))
+        XCTAssertEqual(try String(contentsOf: folder.appending(path: "Report.pdf"), encoding: .utf8), "already here")
+
+        let moved = SearchModel.perform(.move, [source], into: folder)
+        XCTAssertEqual(moved.done[source]?.lastPathComponent, "Report 3.pdf")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
+    }
+
+    func testDuplicatesAreGroupedAndTheFullListComesBack() async throws {
+        _ = try write("a/photo.jpg", "same bytes")
+        _ = try write("b/photo copy.jpg", "same bytes")
+        _ = try write("c/other.jpg", "diff bytes")   // same size, different contents
+        _ = try write("d/small.jpg", "tiny")
+
+        let model = SearchModel(defaults: defaults)
+        model.locationID = root.path
+        model.query = "jpg"
+        model.start()
+        try await finish(model)
+        XCTAssertEqual(model.results.count, 4)
+
+        model.findDuplicates()
+        try await finish(model)
+        XCTAssertEqual(model.results.map(\.name).sorted(), ["photo copy.jpg", "photo.jpg"])
+        XCTAssertEqual(Set(model.results.compactMap { model.duplicateSets[$0.id] }), [1])
+        XCTAssertEqual(model.duplicateSummary.reclaimable, 10)
+
+        model.leaveDuplicates()
+        XCTAssertEqual(model.results.count, 4)
+        XCTAssertFalse(model.showsDuplicates)
+    }
+
+    func testAFileHandedToTheServiceSearchesItsFolder() throws {
+        let file = try write("Projects/plan.txt", "x")
+        let model = SearchModel(defaults: defaults)
+        model.useFolders([file])
+        XCTAssertEqual(model.location, .folder(file.deletingLastPathComponent().standardizedFileURL.path))
+    }
+
+    func testPreviewFindsEveryMatch() throws {
+        let matcher = try QueryMatcher(query: "cat", options: SearchOptions(), anchorsWildcards: false)
+        let text = "cat, then concatenate, then Cat"
+        let found = matcher.ranges(in: text).map { (text as NSString).substring(with: $0) }
+        XCTAssertEqual(found, ["cat", "cat", "Cat"])
     }
 }

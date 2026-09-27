@@ -126,6 +126,10 @@ struct SearchOptions: Equatable, Codable, Sendable {
     var searchContents = false
     var searchTags = false
     var searchComments = false
+    /// Camera and lens, date taken, music tags, owner and permissions.
+    var searchMetadata = false
+    /// Read text out of images and scanned PDFs during a content search (slow; off by default).
+    var recognizeText = false
 
     var mode: MatchMode = .allWords
 
@@ -145,7 +149,9 @@ struct SearchOptions: Equatable, Codable, Sendable {
     var size: SizeFilter = .any
     var excludedKinds: Set<KindGroup> = []
 
-    var searchesAnyField: Bool { searchNames || searchContents || searchTags || searchComments }
+    var searchesAnyField: Bool { searchNames || searchContents || searchTags || searchComments || searchMetadata }
+    /// Whether matches carry a snippet worth a Match column: text found inside or about the file.
+    var readsInsideFiles: Bool { searchContents || searchMetadata }
     var usesFuzzy: Bool { fuzzy && mode.supportsFuzzy }
 
     var prompt: String {
@@ -154,6 +160,7 @@ struct SearchOptions: Equatable, Codable, Sendable {
             searchContents ? "contents" : nil,
             searchTags ? "tags" : nil,
             searchComments ? "comments" : nil,
+            searchMetadata ? "metadata" : nil,
         ].compactMap { $0 }
         guard let last = fields.last else { return "Choose what to search in the options panel" }
         let list = fields.count == 1 ? last : fields.dropLast().joined(separator: ", ") + " and " + last
@@ -175,6 +182,8 @@ extension SearchOptions {
         searchContents = value(.searchContents, defaults.searchContents)
         searchTags = value(.searchTags, defaults.searchTags)
         searchComments = value(.searchComments, defaults.searchComments)
+        searchMetadata = value(.searchMetadata, defaults.searchMetadata)
+        recognizeText = value(.recognizeText, defaults.recognizeText)
         mode = value(.mode, defaults.mode)
         ignoreCase = value(.ignoreCase, defaults.ignoreCase)
         ignoreDiacritics = value(.ignoreDiacritics, defaults.ignoreDiacritics)

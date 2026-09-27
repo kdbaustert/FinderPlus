@@ -148,6 +148,7 @@ final class SearchModel {
         static let recents = "recentQueries"
         static let settings = "settings"
         static let sort = "sortOrder"
+        static let preview = "showsPreview"
     }
 
     var query = ""
@@ -174,12 +175,27 @@ final class SearchModel {
     private(set) var scanned = 0
     private(set) var currentPath = ""
     private(set) var unreadable = 0
-    /// Whether the results on screen came from a search that read file contents.
+    /// Whether the results on screen came from a search that read inside files (contents or
+    /// metadata), so they carry a snippet for the Match column.
     private(set) var searchedContents = false
     /// The last search stopped at the match limit from Settings.
     private(set) var reachedLimit = false
     /// The launch-time panel explaining Full Disk Access.
     var showsFullDiskAccessPrompt = false
+    /// How the preview finds and marks matches: the matcher of the search on screen, when it read
+    /// inside files, and whether that search read text out of images.
+    private(set) var previewContext: PreviewContext?
+    var showsPreview: Bool { didSet { defaults.set(showsPreview, forKey: Key.preview) } }
+
+    struct PreviewContext: Sendable {
+        let matcher: QueryMatcher
+        let recognizeText: Bool
+    }
+    /// Duplicates view: each result's set number. Empty when showing ordinary results.
+    private(set) var duplicateSets: [FileHit.ID: Int] = [:]
+    private(set) var isFindingDuplicates = false
+    @ObservationIgnored private var resultsBeforeDuplicates: [FileHit]?
+    @ObservationIgnored private var duplicateTask: Task<Void, Never>?
 
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private var searchTask: Task<Void, Never>?
@@ -206,6 +222,7 @@ final class SearchModel {
         recentQueries = Self.load([String].self, Key.recents, defaults) ?? []
         settings = Self.load(AppSettings.self, Key.settings, defaults) ?? AppSettings()
         sortOrder = [Self.comparator(for: Self.load(SavedSort.self, Key.sort, defaults) ?? SavedSort())]
+        showsPreview = defaults.bool(forKey: Key.preview)
     }
 
     var isSearching: Bool { phase == .searching }
@@ -244,7 +261,7 @@ final class SearchModel {
         unreadable = 0
         reachedLimit = false
         currentPath = ""
-        searchedContents = options.searchContents
+        searchedContents = options.readsInsideFiles
         phase = .searching
 
         let (query, options, limits, location) = (query, options, settings.limits, location)
@@ -261,6 +278,10 @@ final class SearchModel {
                 return
             }
             guard !Task.isCancelled, let self else { return }
+            leaveDuplicates(restoring: false)
+            previewContext = options.readsInsideFiles
+                ? PreviewContext(matcher: request.textMatcher, recognizeText: options.searchContents && options.recognizeText)
+                : nil
             prepareResults(for: request)
             for await event in SearchEngine.run(request) {
                 // Events already buffered when this search was stopped or replaced must not reach
@@ -280,7 +301,7 @@ final class SearchModel {
         let run = Run(roots: request.roots.map(\.path), options: request.options, limits: request.limits)
         let refinesLast = lastRun == run
         lastRun = run
-        if refinesLast, run.options.searchNames, !run.options.searchContents, run.limits.maxResults == 0 {
+        if refinesLast, run.options.searchNames, !run.options.readsInsideFiles, run.limits.maxResults == 0 {
             results.removeAll {
                 !request.nameMatcher.matches($0.name) || !FileManager.default.fileExists(atPath: $0.url.path)
             }
@@ -483,6 +504,16 @@ final class SearchModel {
         if let first = folders.first { locationID = first.id }
     }
 
+    /// From Finder's service or the Dock icon: search in these folders. A file stands for the
+    /// folder that holds it.
+    func useFolders(_ urls: [URL]) {
+        let folders = urls.map { url in
+            (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true ? url : url.deletingLastPathComponent()
+        }
+        addFolders(folders)
+        focusRequest += 1
+    }
+
     func removeFolder(_ location: SearchLocation) {
         customLocations.removeAll { $0 == location }
         if locationID == location.id { locationID = NSHomeDirectory() }
@@ -556,7 +587,7 @@ final class SearchModel {
         let refused = urls.filter { !outcome.trashed.contains($0) }
         guard !refused.isEmpty else { return }
         if outcome.deniedByPermissions {
-            explainTrashPermission(for: refused)
+            explainPermission(toDo: "delete", refused)
         } else if let message = outcome.message {
             let alert = NSAlert()
             alert.messageText = "Couldn’t move \(Self.describe(refused)) to the Trash"
@@ -595,12 +626,12 @@ final class SearchModel {
 
     /// macOS refuses to trash files in protected places until FinderPlus has Full Disk Access; files
     /// owned by the system need Finder, which can ask for an administrator password.
-    private func explainTrashPermission(for urls: [URL]) {
+    private func explainPermission(toDo verb: String, _ urls: [URL]) {
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "FinderPlus needs Full Disk Access to delete \(Self.describe(urls))"
+        alert.messageText = "FinderPlus needs Full Disk Access to \(verb) \(Self.describe(urls))"
         alert.informativeText = """
-            macOS blocked the move to the Trash. Turn on FinderPlus in System Settings › Privacy & \
+            macOS blocked this. Turn on FinderPlus in System Settings › Privacy & \
             Security › Full Disk Access, then try again.
 
             Files that belong to macOS itself can only be deleted in Finder, which asks for an \
@@ -617,6 +648,234 @@ final class SearchModel {
         default:
             break
         }
+    }
+
+    // MARK: - Export
+
+    /// The results as CSV, in the order shown. The byte-order mark makes Excel read it as UTF-8;
+    /// Numbers ignores it.
+    func resultsCSV(_ rows: [FileHit]? = nil) -> String {
+        let dates = ISO8601DateFormatter()
+        func date(_ value: Date) -> String { value == .distantPast ? "" : dates.string(from: value) }
+        var lines = ["Name,Location,Kind,Size,Date Modified,Date Created,Match"]
+        for hit in rows ?? results {
+            let fields = [
+                hit.name, hit.parentPath, hit.kind, hit.size < 0 ? "" : String(hit.size),
+                date(hit.modified), date(hit.created), hit.snippetText,
+            ]
+            lines.append(fields.map(Self.csvField).joined(separator: ","))
+        }
+        return "\u{FEFF}" + lines.joined(separator: "\r\n") + "\r\n"
+    }
+
+    nonisolated static func csvField(_ value: String) -> String {
+        guard value.contains(where: { ",\"\n\r".contains($0) }) else { return value }
+        return "\"" + value.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+    }
+
+    func exportResults() {
+        guard !results.isEmpty else {
+            NSSound.beep()
+            return
+        }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.commaSeparatedText]
+        panel.nameFieldStringValue = "FinderPlus Results.csv"
+        panel.message = "Export \(results.count.formatted()) results as a spreadsheet"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try resultsCSV().write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            NSApp.presentError(error)
+        }
+    }
+
+    /// Rows as tab-separated text, which pastes into Numbers or Excel as a table.
+    func copyRows(_ ids: Set<FileHit.ID>? = nil) {
+        let rows = hits(ids)
+        guard !rows.isEmpty else { return }
+        let header = "Name\tLocation\tKind\tSize\tDate Modified"
+        let lines = rows.map { hit in
+            [hit.name, hit.parentPath, hit.kind, hit.sizeText, hit.modified.formatted(date: .abbreviated, time: .shortened)]
+                .joined(separator: "\t")
+        }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(([header] + lines).joined(separator: "\n"), forType: .string)
+    }
+
+    // MARK: - Open With, Copy To, Move To
+
+    /// Apps that can open the first of the rows, the default one first.
+    func applications(toOpen ids: Set<FileHit.ID>?) -> [URL] {
+        guard let first = targets(ids).first else { return [] }
+        return NSWorkspace.shared.urlsForApplications(toOpen: first)
+    }
+
+    func open(_ ids: Set<FileHit.ID>?, with application: URL) {
+        let urls = targets(ids)
+        guard !urls.isEmpty else { return }
+        NSWorkspace.shared.open(urls, withApplicationAt: application, configuration: NSWorkspace.OpenConfiguration())
+    }
+
+    func chooseApplicationAndOpen(_ ids: Set<FileHit.ID>?) {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.application]
+        panel.directoryURL = URL(filePath: "/Applications")
+        panel.prompt = "Open"
+        guard panel.runModal() == .OK, let application = panel.url else { return }
+        open(ids, with: application)
+    }
+
+    enum Transfer: Sendable {
+        case copy, move
+
+        var verb: String { self == .copy ? "copy" : "move" }
+    }
+
+    struct TransferOutcome: Sendable {
+        var done: [URL: URL] = [:]
+        var failed: [String] = []
+        var deniedByPermissions = false
+    }
+
+    /// Copies or moves the rows' files into a folder the user picks. Runs off the main thread, so
+    /// a large copy does not freeze the window; an existing name gets " 2", " 3" rather than
+    /// being overwritten. Files inside archives are skipped: they have no file of their own.
+    func transfer(_ ids: Set<FileHit.ID>? = nil, _ kind: Transfer) async {
+        var seen = Set<URL>()
+        let sources = hits(ids).filter { !$0.isArchiveEntry }.map(\.url).filter { seen.insert($0).inserted }
+        guard !sources.isEmpty else {
+            NSSound.beep()
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = kind == .copy ? "Copy Here" : "Move Here"
+        panel.message = "Choose where to \(kind.verb) \(Self.describe(sources))"
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+
+        let outcome = await Task.detached { Self.perform(kind, sources, into: destination) }.value
+        if kind == .move, !outcome.done.isEmpty {
+            results = results.map { hit in
+                guard !hit.isArchiveEntry, let moved = outcome.done[hit.url] else { return hit }
+                return FileHit(
+                    url: moved, name: moved.lastPathComponent, isFolder: hit.isFolder, size: hit.size,
+                    modified: hit.modified, created: hit.created, kind: hit.kind, snippet: hit.snippet)
+            }
+            let remaining = Set(results.map(\.id))
+            selection.formIntersection(remaining)
+            knownIDs = remaining
+        }
+        guard !outcome.failed.isEmpty else { return }
+        let refused = sources.filter { outcome.done[$0] == nil }
+        if outcome.deniedByPermissions {
+            explainPermission(toDo: kind.verb, refused)
+        } else {
+            let alert = NSAlert()
+            alert.messageText = "Couldn’t \(kind.verb) \(Self.describe(refused))"
+            alert.informativeText = outcome.failed.joined(separator: "\n")
+            alert.runModal()
+        }
+    }
+
+    nonisolated static func perform(_ kind: Transfer, _ sources: [URL], into folder: URL) -> TransferOutcome {
+        var outcome = TransferOutcome()
+        for source in sources {
+            let target = availableName(for: source.lastPathComponent, in: folder)
+            do {
+                switch kind {
+                case .copy: try FileManager.default.copyItem(at: source, to: target)
+                case .move: try FileManager.default.moveItem(at: source, to: target)
+                }
+                outcome.done[source] = target
+            } catch {
+                outcome.failed.append("\(source.lastPathComponent): \(error.localizedDescription)")
+                if isPermissionError(error) { outcome.deniedByPermissions = true }
+            }
+        }
+        return outcome
+    }
+
+    /// "Report.pdf", then "Report 2.pdf", "Report 3.pdf" — Finder's convention.
+    nonisolated static func availableName(for name: String, in folder: URL) -> URL {
+        let base = (name as NSString).deletingPathExtension
+        let ext = (name as NSString).pathExtension
+        var candidate = folder.appending(path: name)
+        var number = 2
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            candidate = folder.appending(path: ext.isEmpty ? "\(base) \(number)" : "\(base) \(number).\(ext)")
+            number += 1
+        }
+        return candidate
+    }
+
+    // MARK: - Duplicates
+
+    var showsDuplicates: Bool { !duplicateSets.isEmpty }
+
+    /// How many sets, how many files in them, and the space the extra copies take.
+    var duplicateSummary: (sets: Int, files: Int, reclaimable: Int64) {
+        let sets = Dictionary(grouping: results.filter { duplicateSets[$0.id] != nil }) { duplicateSets[$0.id]! }
+        let reclaimable = sets.values.reduce(Int64(0)) { total, set in
+            total + Int64(set.count - 1) * max(set.first?.size ?? 0, 0)
+        }
+        return (sets.count, sets.values.reduce(0) { $0 + $1.count }, reclaimable)
+    }
+
+    /// Narrows the results to files whose contents match another result's, grouped into sets.
+    func findDuplicates() {
+        guard !isSearching, !isFindingDuplicates else { return }
+        let base = resultsBeforeDuplicates ?? results
+        let candidates = base.filter { !$0.isFolder && !$0.isArchiveEntry && $0.size > 0 }
+            .map { DuplicateFinder.Candidate(id: $0.id, url: $0.url, size: $0.size) }
+        guard candidates.count > 1 else {
+            NSSound.beep()
+            return
+        }
+        isFindingDuplicates = true
+        duplicateTask = Task { [weak self] in
+            let sets = await Task.detached { DuplicateFinder.sets(in: candidates) }.value
+            guard let self, !Task.isCancelled else { return }
+            isFindingDuplicates = false
+            guard !sets.isEmpty else {
+                let alert = NSAlert()
+                alert.messageText = "No duplicates"
+                alert.informativeText = "None of these \(candidates.count.formatted()) files have the same contents as another."
+                alert.runModal()
+                return
+            }
+            var numbers: [FileHit.ID: Int] = [:]
+            for (index, set) in sets.enumerated() {
+                for id in set { numbers[id] = index + 1 }
+            }
+            resultsBeforeDuplicates = base
+            duplicateSets = numbers
+            results = base.filter { numbers[$0.id] != nil }
+                .sorted { (numbers[$0.id]!, $0.name) < (numbers[$1.id]!, $1.name) }
+            selection.formIntersection(Set(results.map(\.id)))
+        }
+    }
+
+    /// Back to the full results. A new search leaves without restoring: it replaces them.
+    func leaveDuplicates(restoring: Bool = true) {
+        duplicateTask?.cancel()
+        isFindingDuplicates = false
+        guard let before = resultsBeforeDuplicates else { return }
+        if restoring {
+            // Rows trashed or moved while viewing duplicates stay gone; moved ones come back at
+            // their new location.
+            let shown = Set(results.map(\.id))
+            let removed = Set(duplicateSets.keys).subtracting(shown)
+            let beforeIDs = Set(before.map(\.id))
+            results = before.filter { !removed.contains($0.id) } + results.filter { !beforeIDs.contains($0.id) }
+            knownIDs = Set(results.map(\.id))
+            resort()
+        }
+        resultsBeforeDuplicates = nil
+        duplicateSets = [:]
     }
 
     // MARK: - Full Disk Access
