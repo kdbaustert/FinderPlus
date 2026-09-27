@@ -89,6 +89,15 @@ files, and anything that was never indexed. Runs on macOS 26 and later.
 - **About FinderPlus** (in the app menu, and as a tab in Settings): the version, who made it, and a
   link to the project on GitHub.
 
+### Updates
+
+- Updates itself from this repository's [GitHub Releases](https://github.com/kdbaustert/FinderPlus/releases):
+  it checks once a day and asks before installing, or installs on its own if you choose that in
+  Settings. **Check for Updates…** is in the app menu.
+- **Stable and beta releases.** Everyone gets stable releases; turn on **Receive beta updates** in
+  Settings to get betas as well, before they become stable.
+- Every update is signed, and checked against that signature before it installs.
+
 ## Keyboard shortcuts
 
 | Action | Shortcut |
@@ -121,8 +130,9 @@ the status bar counts the folders a search couldn't read.
 
 ## Privacy
 
-FinderPlus makes no network requests: no telemetry, analytics, crash reporting or account.
-Everything it reads stays on your Mac, including text recognised in images. Content searches and
+No telemetry, analytics, crash reporting or account. The only network request FinderPlus makes on
+its own is the daily update check, which fetches the release list from GitHub and sends nothing
+about you or your Mac. Everything it reads stays on your Mac, including text recognised in images. Content searches and
 duplicate checks skip iCloud files that aren't downloaded, so they never download your files.
 
 ## Building
@@ -131,6 +141,18 @@ duplicate checks skip iCloud files that aren't downloaded, so they never downloa
 ./build.sh --install  # builds build/FinderPlus.app, copies it to /Applications and launches it
 swift test            # the test suite
 ```
+
+To publish a release, commit and push, then:
+
+```sh
+VERSION=1.1.0 BUILD=2 ./release.sh --publish                 # a stable release
+VERSION=1.2.0-beta.1 BUILD=3 ./release.sh --beta --publish   # a beta, published as a pre-release
+```
+
+`BUILD` must grow with every release, betas and stable alike. Without `--publish` the script
+builds and prepares everything but uploads nothing. The update feed lives on a release named
+`appcast`, which the script creates on the first publish and updates on every one after. Releases are signed without an Apple Developer ID, so the first download needs
+right-click → **Open**; updates after that install normally.
 
 Building needs Xcode. To change the app icon, edit `Resources/Icon/make-icon.swift` and run
 `swift Resources/Icon/make-icon.swift` from the repository root before building.

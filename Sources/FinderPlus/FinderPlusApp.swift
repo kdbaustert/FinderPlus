@@ -39,6 +39,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.servicesProvider = self
         NSUpdateDynamicServices()
+        // Starts Sparkle's daily check. Skipped in development builds, which have no feed.
+        if Updater.isConfigured { _ = Updater.shared }
     }
 
     /// Folders dropped on the Dock icon, or opened with FinderPlus.
@@ -74,6 +76,8 @@ struct SearchCommands: Commands {
     var body: some Commands {
         CommandGroup(replacing: .appInfo) {
             Button("About FinderPlus") { About.showPanel() }
+            Button("Check for Updates…") { Updater.shared.checkForUpdates() }
+                .disabled(!Updater.isConfigured || !Updater.shared.canCheck)
         }
         CommandGroup(after: .newItem) {
             Divider()

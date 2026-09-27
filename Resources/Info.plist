@@ -59,6 +59,27 @@
 			</array>
 		</dict>
 	</array>
+	<!-- Updates, through Sparkle. The feed is appcast.xml on a GitHub release tagged "appcast",
+	     which release.sh re-uploads on every release, stable or beta. Not /releases/latest/: GitHub
+	     never counts a pre-release as latest, so a feed there could not list betas, and a beta
+	     published before any stable release would have no feed at all. build.sh deletes this key
+	     from local builds, so a development copy never updates itself out from under its
+	     developer. -->
+	<key>SUFeedURL</key>
+	<string>https://github.com/kdbaustert/FinderPlus/releases/download/appcast/appcast.xml</string>
+	<!-- The public half of the EdDSA key every release is signed with (the same key as Cmd-Tab's;
+	     one key serves every app). Sparkle checks each download against it before unpacking, so
+	     nobody else can ship FinderPlus's users an update. The private half is in the login
+	     keychain, where release.sh's generate_appcast reads it. -->
+	<key>SUPublicEDKey</key>
+	<string>FYMMALSs2mAccV/rUgQcByyY+mdkpXSBA/nD4JpwvT0=</string>
+	<!-- Check daily, but install only when asked; both can be changed in Settings. -->
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUAutomaticallyUpdate</key>
+	<false/>
+	<key>SUScheduledCheckInterval</key>
+	<integer>86400</integer>
 	<key>LSMinimumSystemVersion</key>
 	<string>26.0</string>
 	<key>LSApplicationCategoryType</key>

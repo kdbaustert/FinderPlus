@@ -8,9 +8,16 @@ let package = Package(
     // Back-deploying would mean an availability fork around every surface in the UI. The string
     // form because `.v26` needs tools 6.2 and nothing else here does.
     platforms: [.macOS("26.0")],
+    dependencies: [
+        // Updates. Distributed as a binary XCFramework, so build.sh has to copy it into
+        // Contents/Frameworks, add an rpath, and sign it before the app — see the comments there.
+        // At least the version Cmd-Tab ships.
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.9.5"),
+    ],
     targets: [
         .executableTarget(
             name: "FinderPlus",
+            dependencies: [.product(name: "Sparkle", package: "Sparkle")],
             path: "Sources/FinderPlus",
             // Swift 6 language mode. The search walks the disk on a detached task and fans content
             // reads out across every core, then hands hits back to the main actor — exactly the

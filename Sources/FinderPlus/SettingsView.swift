@@ -47,6 +47,7 @@ private struct GeneralSettings: View {
             } footer: {
                 Text("Recent searches appear under the clock in the search field.")
             }
+            UpdateSettings()
             Section {
                 LabeledContent("Full Disk Access") {
                     if hasFullDiskAccess {
@@ -150,5 +151,38 @@ private struct SearchSettings: View {
         let known = model.settings.skippedFolderNames.contains { $0.caseInsensitiveCompare(name) == .orderedSame }
         if !known { model.settings.skippedFolderNames.append(name) }
         newFolderName = ""
+    }
+}
+
+/// Settings → General → Updates.
+private struct UpdateSettings: View {
+    var body: some View {
+        @Bindable var updater = Updater.shared
+        Section {
+            if Updater.isConfigured {
+                Toggle("Check for updates automatically", isOn: $updater.automaticallyChecks)
+                Toggle("Download and install updates automatically", isOn: $updater.automaticallyDownloads)
+                    .disabled(!updater.automaticallyChecks)
+                Toggle("Receive beta updates", isOn: $updater.receivesBetas)
+                LabeledContent("Last checked") {
+                    Text(updater.lastCheck?.formatted(date: .abbreviated, time: .shortened) ?? "Never")
+                }
+                LabeledContent("Updates") {
+                    Button("Check Now") { updater.checkForUpdates() }
+                        .disabled(!updater.canCheck)
+                }
+            } else {
+                Text("This development build doesn’t update itself. Copies installed from a GitHub release do.")
+                    .foregroundStyle(.secondary)
+            }
+        } header: {
+            Text("Updates")
+        } footer: {
+            Text("""
+                New versions come from FinderPlus’s releases on GitHub. Each is signed, and checked before \
+                it installs. Betas arrive before stable releases and are less proven; turning them off keeps \
+                the beta you have until a newer stable release comes out.
+                """)
+        }
     }
 }
