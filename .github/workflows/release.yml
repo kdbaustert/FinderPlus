@@ -60,6 +60,10 @@ jobs:
       # The key that signs each update. Its public half is SUPublicEDKey in Info.plist; if the two
       # ever differ, every installed copy silently refuses every update — so that is checked here,
       # before anything is built or published.
+      #
+      # Signing itself reads the key from a file (SPARKLE_KEY_FILE below), not the keychain: read
+      # from the runner's keychain, generate_appcast stops for a permission prompt that no one is
+      # there to answer, and the job hangs until it times out (seen on the first beta).
       - name: Import the Sparkle signing key
         env:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
@@ -71,9 +75,8 @@ jobs:
           fi
           swift package resolve
           GENERATE_KEYS="$(find .build/artifacts -type f -name generate_keys -perm -u+x -print -quit)"
-          printf '%s' "$SPARKLE_PRIVATE_KEY" > "$RUNNER_TEMP/sparkle_key"
+          ( umask 077; printf '%s' "$SPARKLE_PRIVATE_KEY" > "$RUNNER_TEMP/sparkle_key" )
           "$GENERATE_KEYS" -f "$RUNNER_TEMP/sparkle_key"
-          rm -f "$RUNNER_TEMP/sparkle_key"
           EXPECTED="$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' Resources/Info.plist)"
           ACTUAL="$("$GENERATE_KEYS" -p)"
           if [[ "$EXPECTED" != "$ACTUAL" ]]; then
@@ -89,6 +92,7 @@ jobs:
       - name: Build and publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPARKLE_KEY_FILE: ${{ runner.temp }}/sparkle_key
           VERSION: ${{ steps.version.outputs.version }}
           BUILD: ${{ steps.version.outputs.build }}
         run: |
@@ -98,3 +102,8 @@ jobs:
           else
             ./release.sh --publish
           fi
+
+      # Even when a step above failed: the key file must not outlive the job.
+      - name: Remove the signing key file
+        if: always()
+        run: rm -f "$RUNNER_TEMP/sparkle_key"
