@@ -358,14 +358,16 @@ final class SearchModel {
     /// The rows on screen the new walk is certain to report again, still to be checked on disk.
     /// Content searches never keep rows — a kept row would keep the old query's snippet — and
     /// neither do searches with a match limit, which kept rows could push past. A row moved
-    /// outside the roots since is not kept either: the walk would never report it.
+    /// outside the roots since is not kept either: the walk would never report it. Nor is an
+    /// archive entry: the zip still existing says nothing of the entry, and the walk re-lists it.
     private func refinable(for request: SearchRequest) -> (run: Run, rows: [FileHit]) {
         let run = Run(roots: request.roots.map(\.path), options: request.options, limits: request.limits)
         guard lastRun == run, run.options.searchNames, !run.options.readsInsideFiles, run.limits.maxResults == 0
         else { return (run, []) }
         let roots = run.roots.map { $0.hasSuffix("/") ? $0 : $0 + "/" }
         let rows = results.filter { hit in
-            request.nameMatcher.matches(hit.name) && roots.contains { hit.url.path.hasPrefix($0) }
+            !hit.isArchiveEntry && request.nameMatcher.matches(hit.name)
+                && roots.contains { hit.url.path.hasPrefix($0) }
         }
         return (run, rows)
     }
@@ -609,6 +611,15 @@ final class SearchModel {
 
     // MARK: - File actions
 
+    /// Renames, copies, moves and trashes still running, across every window. They run off the
+    /// main thread, so quitting would kill one mid-batch — a rename's files stranded under hidden holding
+    /// names — and the app delegate holds off quitting until this is back to zero. Counted until
+    /// each action's last alert is dismissed, so a failure's explanation is read before the quit.
+    static private(set) var batchesInFlight = 0 {
+        didSet { if batchesInFlight == 0 { onBatchesDrained?() } }
+    }
+    static var onBatchesDrained: (() -> Void)?
+
     /// The rows for `ids`, or for the selection, in display order.
     func hits(_ ids: Set<FileHit.ID>?) -> [FileHit] {
         let ids = ids ?? selection
@@ -632,7 +643,15 @@ final class SearchModel {
     }
 
     func open(_ ids: Set<FileHit.ID>? = nil) {
-        for url in targets(ids) { NSWorkspace.shared.open(url) }
+        // An entry's archive is shown in Finder, not opened: Archive Utility would extract all of
+        // it beside the zip to get at one file. Trash declines entries for the same reason.
+        let rows = hits(ids)
+        var seen = Set<URL>()
+        for url in rows.filter({ !$0.isArchiveEntry }).map(\.url) where seen.insert(url).inserted {
+            NSWorkspace.shared.open(url)
+        }
+        let archives = rows.filter(\.isArchiveEntry).map(\.url).filter { seen.insert($0).inserted }
+        if !archives.isEmpty { NSWorkspace.shared.activateFileViewerSelecting(archives) }
     }
 
     func reveal(_ ids: Set<FileHit.ID>? = nil) {
@@ -668,6 +687,8 @@ final class SearchModel {
             alert.addButton(withTitle: "Cancel")
             guard alert.runModal() == .alertFirstButtonReturn else { return }
         }
+        Self.batchesInFlight += 1
+        defer { Self.batchesInFlight -= 1 }
         let outcome = await Self.recycle(urls)
         results.removeAll { outcome.trashed.contains($0.url) }
         let remaining = Set(results.map(\.id))
@@ -873,6 +894,8 @@ final class SearchModel {
         panel.message = "Choose where to \(kind.verb) \(Self.describe(sources))"
         guard panel.runModal() == .OK, let destination = panel.url else { return }
 
+        Self.batchesInFlight += 1
+        defer { Self.batchesInFlight -= 1 }
         let outcome = await Task.detached { Self.perform(kind, sources, into: destination) }.value
         if kind == .move, !outcome.done.isEmpty {
             results = results.map { hit in
@@ -949,6 +972,8 @@ final class SearchModel {
     /// stay selected under their new IDs.
     func rename(_ steps: [RenameStep]) async {
         guard !steps.isEmpty else { return }
+        Self.batchesInFlight += 1
+        defer { Self.batchesInFlight -= 1 }
         let outcome = await Task.detached { Self.performRename(steps) }.value
         if !outcome.done.isEmpty {
             let renamed = Dictionary(uniqueKeysWithValues: outcome.done.map { ($0.key.path, $0.value.path) })

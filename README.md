@@ -170,6 +170,25 @@ download needs right-click → **Open**; updates after that install normally.
 Building needs Xcode. To change the app icon, edit `Resources/Icon/make-icon.swift` and run
 `swift Resources/Icon/make-icon.swift` from the repository root before building.
 
+### A stable signing identity for releases
+
+macOS ties Full Disk Access, Automation and folder permissions to the app's code signature. An
+ad-hoc signature changes with every build, so without a fixed identity every update asks for them
+again. To keep them, give the release workflow a self-signed certificate, once:
+
+1. In Keychain Access, choose **Certificate Assistant → Create a Certificate…**. Name it
+   `FinderPlus Release`, set Identity Type to **Self-Signed Root** and Certificate Type to
+   **Code Signing**.
+2. Right-click the new certificate, **Export** it as a `.p12` with its private key, and give it a
+   password.
+3. Store both as repository secrets:
+   `base64 -i FinderPlus.p12 | gh secret set CODESIGN_P12_BASE64` and
+   `gh secret set CODESIGN_P12_PASSWORD`.
+
+Releases are then signed with it; without the secrets they stay ad-hoc signed and the release run
+warns about it. Keep the certificate: signing with a different one resets the permissions once
+more.
+
 ## Contributing
 
 Issues and pull requests are welcome — for a bug, say what you searched for, where, and with which

@@ -213,7 +213,14 @@ enum SearchEngine {
                 let name = (path as NSString).lastPathComponent
                 // Finder's resource-fork shadows, not files anyone put in the archive.
                 guard !name.isEmpty, !path.hasPrefix("__MACOSX"), !name.hasPrefix("._") else { continue }
-                if name.hasPrefix("."), !options.includeHidden { continue }
+                // Every component, as the walk prunes whole folders: "proj/.git/HEAD" is hidden too.
+                let components = path.split(separator: "/")
+                if !options.includeHidden, components.contains(where: { $0.hasPrefix(".") }) { continue }
+                if components.dropLast(isEntryFolder ? 0 : 1)
+                    .contains(where: { limits.skippedFolderNames.contains($0.lowercased()) })
+                {
+                    continue
+                }
                 let wanted = switch options.kind {
                 case .filesAndFolders: true
                 case .files: !isEntryFolder
@@ -318,7 +325,9 @@ enum SearchEngine {
                         if candidates.count >= 64 { searchCandidateContents() }
                     }
                 }
-                if options.includeArchiveContents, options.searchNames, isRegularFile, ext == "zip" {
+                if options.includeArchiveContents, options.searchNames, isRegularFile, ext == "zip",
+                   !isPlaceholder(url)
+                {
                     searchArchive(at: url, modified: values.contentModificationDate ?? .distantPast,
                                   created: values.creationDate ?? .distantPast)
                 }
@@ -380,20 +389,29 @@ enum SearchEngine {
         return lstat(url.path, &info) == 0 && info.st_flags & UInt32(SF_DATALESS) != 0
     }
 
-    /// The entry paths in a zip archive, read from its central directory by `zipinfo` — no
-    /// extraction. An unreadable or encrypted archive yields nothing.
+    /// The entry paths in a zip archive, read from its central directory by `bsdtar` — no
+    /// extraction. Encrypted archives still list, as their names are not encrypted; an unreadable
+    /// or corrupt one yields nothing.
     static func zipEntries(of archive: URL) -> [String] {
         let process = Process()
-        process.executableURL = URL(filePath: "/usr/bin/zipinfo")
-        process.arguments = ["-1", archive.path]
+        process.executableURL = URL(filePath: "/usr/bin/bsdtar")
+        process.arguments = ["-tf", archive.path]
+        // Pinned rather than inherited: launched from Finder there is no LANG, and in the C locale
+        // every non-ASCII byte of a name is printed as "?".
+        process.environment = ["LC_ALL": "en_US.UTF-8"]
         let output = Pipe()
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
         do { try process.run() } catch { return [] }
         let data = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
-        return text.split(whereSeparator: \.isNewline).map(String.init)
+        // A truncated or corrupt archive lists what it could before failing, and junk that is not
+        // an archive can print its own text as if it were names; zipinfo listed neither.
+        guard process.terminationStatus == 0 else { return [] }
+        // Lossy per byte: bsdtar escapes a C1 control character's second byte alone, and a strict
+        // decode would then fall back to Latin-1 and turn every other name to mojibake. Split on
+        // "\n" only, the one separator bsdtar writes; it escapes control characters within names.
+        return String(decoding: data, as: UTF8.self).split(separator: "\n").map(String.init)
     }
 
     /// Plain text, PDF and word-processor documents. Anything else is sniffed: no NUL bytes in the

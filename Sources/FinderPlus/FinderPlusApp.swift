@@ -79,7 +79,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingFolders: [URL] = []
     private var pendingQuery: String?
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    /// Not while a batch runs, or closing the last window would quit without waiting for it.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        SearchModel.batchesInFlight == 0
+    }
+
+    /// Quitting waits for renames, moves and trashes in flight rather than killing them: a rename
+    /// stopped mid-batch leaves files under hidden holding names.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard SearchModel.batchesInFlight > 0 else { return .terminateNow }
+        SearchModel.onBatchesDrained = {
+            SearchModel.onBatchesDrained = nil
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.servicesProvider = self

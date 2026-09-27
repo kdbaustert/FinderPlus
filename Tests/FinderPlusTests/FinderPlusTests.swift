@@ -3,6 +3,15 @@ import ImageIO
 import UniformTypeIdentifiers
 import XCTest
 import os
+
+/// Every suite is a plist in ~/Library/Preferences. `removePersistentDomain` empties it but
+/// cfprefsd keeps the empty file, so the file goes too — domain first, so nothing rewrites it.
+func removeSuite(named name: String) {
+    UserDefaults().removePersistentDomain(forName: name)
+    let plist = FileManager.default.homeDirectoryForCurrentUser
+        .appending(path: "Library/Preferences/\(name).plist")
+    try? FileManager.default.removeItem(at: plist)
+}
 @testable import FinderPlus
 
 final class QueryMatcherTests: XCTestCase {
@@ -277,6 +286,7 @@ final class SearchOptionsTests: XCTestCase {
 @MainActor
 final class SearchModelTests: XCTestCase {
     private var root: URL!
+    private var suiteName: String!
     private var defaults: UserDefaults!
 
     override func setUp() async throws {
@@ -285,11 +295,14 @@ final class SearchModelTests: XCTestCase {
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             try "x".write(to: root.appending(path: name), atomically: true, encoding: .utf8)
         }
-        defaults = UserDefaults(suiteName: "FinderPlusTests-\(UUID().uuidString)")
+        suiteName = "FinderPlusTests-\(UUID().uuidString)"
+        defaults = UserDefaults(suiteName: suiteName)
     }
 
+    // Every suite is a plist in ~/Library/Preferences: without this, each run leaves one behind.
     override func tearDown() async throws {
         try? FileManager.default.removeItem(at: root)
+        removeSuite(named: suiteName)
     }
 
     private func finish(_ model: SearchModel) async throws {
@@ -496,14 +509,21 @@ final class AuditFixTests: XCTestCase {
         }
     }
 
-    // Stopping an unstarted walk proves little: a stop that arrives mid-batch must also halt it.
+    // Stopping an unstarted walk proves little: a stop that arrives while content is being read
+    // must also halt it. The walk polls once per item and queues a content batch every 64 files,
+    // whose workers each poll once, so polls 65–128 belong to the first batch and the stop is
+    // timed to land inside it. What this cannot show is whether the workers themselves skip their
+    // reads — the walk's own check before item 65 halts it either way, and the hit count cannot
+    // tell the two apart. It guards the walk-level stop under batch load: the second batch never
+    // starts, and far fewer than every file is reported.
     func testStoppingMidWalkHaltsIt() throws {
-        for index in 0..<50 { _ = try write("file\(index).txt", "needle") }
+        for index in 0..<200 { _ = try write("file\(index).txt", "needle") }
         let polls = OSAllocatedUnfairLock(initialState: 0)
         let hits = try walk("needle", { $0.searchNames = false; $0.searchContents = true }) {
-            polls.withLock { $0 += 1; return $0 > 10 }
+            polls.withLock { $0 += 1; return $0 > 100 }
         }
-        XCTAssertLessThan(hits.count, 50)
+        XCTAssertLessThanOrEqual(hits.count, 64)
+        XCTAssertLessThan(hits.count, 200)
     }
 
     // Audit 11: another user whose name starts with this one's must not become "~b/…".
@@ -567,11 +587,48 @@ final class AuditFixTests: XCTestCase {
         XCTAssertEqual(try walk("reports") { $0.includeArchiveContents = true; $0.kind = .folders }.map(\.name),
                        ["Reports"])
     }
+
+    // `zipinfo` printed non-ASCII entry names in a lossy form, so "Straße.txt" in an archive could
+    // never be found by name. Neither name decomposes, so filesystem normalization cannot blur it.
+    func testZipEntryNamesKeepTheirNonASCIICharacters() throws {
+        let names = ["Straße.txt", "Kenny\u{2019}s notes.txt"]
+        for name in names { _ = try write(name) }
+        let zip = Process()
+        zip.executableURL = URL(filePath: "/usr/bin/zip")
+        zip.currentDirectoryURL = root
+        zip.arguments = ["-q", "names.zip"] + names
+        try zip.run()
+        zip.waitUntilExit()
+        XCTAssertEqual(zip.terminationStatus, 0)
+
+        XCTAssertEqual(SearchEngine.zipEntries(of: root.appending(path: "names.zip")).sorted(), names.sorted())
+    }
+
+    // Only an entry's own name was checked for a leading dot, so everything inside an archived
+    // ".git" folder surfaced even with hidden files excluded.
+    func testArchiveEntriesUnderAHiddenFolderStayHidden() throws {
+        _ = try write("proj/.git/HEAD")
+        _ = try write("proj/readme.txt")
+        let zip = Process()
+        zip.executableURL = URL(filePath: "/usr/bin/zip")
+        zip.currentDirectoryURL = root
+        zip.arguments = ["-qr", "bundle.zip", "proj"]
+        try zip.run()
+        zip.waitUntilExit()
+        try FileManager.default.removeItem(at: root.appending(path: "proj"))
+
+        XCTAssertEqual(try walk("head") { $0.includeArchiveContents = true }, [])
+        XCTAssertEqual(try walk("readme") { $0.includeArchiveContents = true }.map(\.name), ["readme.txt"])
+        // Proves the archive really holds the entry, so the empty result above is the filter.
+        XCTAssertEqual(try walk("head") { $0.includeArchiveContents = true; $0.includeHidden = true }.map(\.name),
+                       ["HEAD"])
+    }
 }
 
 @MainActor
 final class AuditModelTests: XCTestCase {
     private var root: URL!
+    private var suiteName: String!
     private var defaults: UserDefaults!
 
     override func setUp() async throws {
@@ -580,11 +637,14 @@ final class AuditModelTests: XCTestCase {
         for name in ["invoice-march.txt", "notes.md", "notes-old.md"] {
             try "x".write(to: root.appending(path: name), atomically: true, encoding: .utf8)
         }
-        defaults = UserDefaults(suiteName: "FinderPlusAudit-\(UUID().uuidString)")
+        suiteName = "FinderPlusAudit-\(UUID().uuidString)"
+        defaults = UserDefaults(suiteName: suiteName)
     }
 
+    // Every suite is a plist in ~/Library/Preferences: without this, each run leaves one behind.
     override func tearDown() async throws {
         try? FileManager.default.removeItem(at: root)
+        removeSuite(named: suiteName)
     }
 
     private func finish(_ model: SearchModel) async throws {
@@ -746,16 +806,20 @@ final class DocumentTextTests: XCTestCase {
 @MainActor
 final class ResultActionTests: XCTestCase {
     private var root: URL!
+    private var suiteName: String!
     private var defaults: UserDefaults!
 
     override func setUp() async throws {
         root = FileManager.default.temporaryDirectory.appending(path: "FinderPlusActions-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        defaults = UserDefaults(suiteName: "FinderPlusActions-\(UUID().uuidString)")
+        suiteName = "FinderPlusActions-\(UUID().uuidString)"
+        defaults = UserDefaults(suiteName: suiteName)
     }
 
+    // Every suite is a plist in ~/Library/Preferences: without this, each run leaves one behind.
     override func tearDown() async throws {
         try? FileManager.default.removeItem(at: root)
+        removeSuite(named: suiteName)
     }
 
     private func write(_ name: String, _ text: String) throws -> URL {
@@ -954,14 +1018,55 @@ final class BatchRenameTests: XCTestCase {
             .filter { $0.hasPrefix(".FinderPlus-rename-") }
         XCTAssertEqual(leftovers, [])
     }
+
+    // The test above fails while parking, so nothing has landed yet. A failure while landing is
+    // the harder unwind: a file already under its new name must go back to its holding name before
+    // anything is unparked, and a file that sat at a target name all along must not be disturbed.
+    func testAFailureWhileLandingUndoesTheFilesAlreadyRenamed() throws {
+        let manager = FileManager.default
+        let folder = manager.temporaryDirectory.appending(path: "FinderPlusRename-\(UUID().uuidString)")
+        try manager.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? manager.removeItem(at: folder) }
+        let one = folder.appending(path: "1.txt")
+        let two = folder.appending(path: "2.txt")
+        let a = folder.appending(path: "A.txt")
+        let b = folder.appending(path: "B.txt")
+        try "first".write(to: one, atomically: true, encoding: .utf8)
+        try "second".write(to: two, atomically: true, encoding: .utf8)
+        try "interloper".write(to: b, atomically: true, encoding: .utf8)
+
+        // Both park, "1" lands as "A", then "2" cannot land because "B.txt" is taken.
+        let outcome = SearchModel.performRename([
+            RenameStep(source: one, target: a),
+            RenameStep(source: two, target: b),
+        ])
+        XCTAssertTrue(outcome.done.isEmpty)
+        XCTAssertFalse(outcome.failed.isEmpty)
+        XCTAssertEqual(try String(contentsOf: one, encoding: .utf8), "first")
+        XCTAssertEqual(try String(contentsOf: two, encoding: .utf8), "second")
+        XCTAssertFalse(manager.fileExists(atPath: a.path))
+        XCTAssertEqual(try String(contentsOf: b, encoding: .utf8), "interloper")
+        let leftovers = try manager.contentsOfDirectory(atPath: folder.path)
+            .filter { $0.hasPrefix(".FinderPlus-rename-") }
+        XCTAssertEqual(leftovers, [])
+        // Only a file left stranded is ever named by its holding name; here none was.
+        XCTAssertFalse(outcome.failed.contains { $0.contains(".FinderPlus-rename-") }, "\(outcome.failed)")
+    }
 }
 
 @MainActor
 final class PreferencesTests: XCTestCase {
+    private var suiteName: String!
     private var defaults: UserDefaults!
 
     override func setUp() async throws {
-        defaults = UserDefaults(suiteName: "FinderPlusPreferences-\(UUID().uuidString)")
+        suiteName = "FinderPlusPreferences-\(UUID().uuidString)"
+        defaults = UserDefaults(suiteName: suiteName)
+    }
+
+    // Every suite is a plist in ~/Library/Preferences: without this, each run leaves one behind.
+    override func tearDown() async throws {
+        removeSuite(named: suiteName)
     }
 
     func testWindowsShareSettingsAndRecents() {

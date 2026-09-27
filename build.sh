@@ -11,9 +11,16 @@ set -euo pipefail
 cd "$(dirname "$0")"
 APP="build/FinderPlus.app"
 
+# A release is universal: macOS 26 still runs on some Intel Macs. A local build stays native, at
+# half the compile time.
+ARCH_ARGS=()
+if [[ "${RELEASE:-0}" == "1" ]]; then
+    ARCH_ARGS=(--arch arm64 --arch x86_64)
+fi
 echo "==> Compiling"
-swift build -c release
-BIN="$(swift build -c release --show-bin-path)/FinderPlus"
+# ${a[@]+...}: macOS ships bash 3.2, where an empty array under `set -u` is an error.
+swift build -c release ${ARCH_ARGS[@]+"${ARCH_ARGS[@]}"}
+BIN="$(swift build -c release ${ARCH_ARGS[@]+"${ARCH_ARGS[@]}"} --show-bin-path)/FinderPlus"
 
 # The Shortcuts/Siri actions in Intents.swift only exist to the system through a
 # Metadata.appintents bundle, which Xcode builds produce and `swift build` does not. The metadata
@@ -44,6 +51,13 @@ echo "==> Assembling bundle"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/FinderPlus"
+if [[ "${RELEASE:-0}" == "1" ]]; then
+    ARCHS="$(lipo -archs "$APP/Contents/MacOS/FinderPlus")"
+    if [[ " $ARCHS " != *" arm64 "* || " $ARCHS " != *" x86_64 "* ]]; then
+        echo "==> ERROR: the release binary is '$ARCHS', not universal (arm64 and x86_64)" >&2
+        exit 1
+    fi
+fi
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 # The icon, compiled the way Xcode does it: Assets.car (read through CFBundleIconName — the Dock
 # showed a blank placeholder for a bare .icns) plus AppIcon.icns for anything older.
@@ -151,8 +165,13 @@ if [[ "${1:-}" == "--install" ]]; then
         sleep 0.1
     done
     pkill -9 -x FinderPlus 2>/dev/null || true
+    # Copied beside the old copy first, so a failed copy leaves it installed; only the rename below
+    # runs with no app in place. Not named *.app, so nothing registers the half-copied bundle.
+    STAGED="/Applications/.FinderPlus-installing"
+    rm -rf "$STAGED"
+    cp -R "$APP" "$STAGED"
     rm -rf /Applications/FinderPlus.app
-    cp -R "$APP" /Applications/FinderPlus.app
+    mv "$STAGED" /Applications/FinderPlus.app
     # Services are read from a cache; without a refresh "Search with FinderPlus" can take until the
     # next login to appear in Finder's right-click menu.
     /System/Library/CoreServices/pbs -update

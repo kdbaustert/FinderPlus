@@ -212,12 +212,13 @@ struct QueryMatcher: @unchecked Sendable {
     }
 
     /// Every place the query's words or patterns occur, for highlighting a whole document in the
-    /// preview. Offsets are in the text as given when accent folding keeps its length, which it
-    /// almost always does; `limit` bounds the work on a huge file.
+    /// preview. Offsets are in the text as given: NFC's are mapped back, and accent folding keeps
+    /// the length, which it almost always does; `limit` bounds the work on a huge file.
     func ranges(in text: String, limit: Int = 500) -> [NSRange] {
-        // Not NFC: these offsets go back into `text`, and NFC's changes in length cannot be undone
-        // by a length check (see `snippet`). Text in the same form as the query still highlights.
-        let subject = foldsDiacritics ? Self.fold(text) : text
+        // NFC as `matches` sees it, or a file that matched could highlight nothing. Its changes in
+        // length cannot be undone by a length check (see `snippet`), hence the map.
+        let composition = foldsDiacritics ? nil : Composition(text)
+        let subject = composition?.subject ?? Self.fold(text)
         let whole = NSRange(location: 0, length: (subject as NSString).length)
         var found: [NSRange] = []
         for pattern in clauses.flatMap(\.required) {
@@ -238,7 +239,79 @@ struct QueryMatcher: @unchecked Sendable {
             }
             if found.count >= limit { break }
         }
-        return found.sorted { $0.location < $1.location }
+        // The map keeps order, so sorting first is sorting the result.
+        let sorted = found.sorted { $0.location < $1.location }
+        return composition.map { composition in sorted.map(composition.original) } ?? sorted
+    }
+
+    /// Text in NFC, and the way back: where each sequence NFC changed sits in the text as given.
+    private struct Composition {
+        let subject: String
+        /// The composed character sequences NFC changed, in order: UTF-16 offsets in `subject`
+        /// and in the original text.
+        private var changed: [(subject: Range<Int>, original: Range<Int>)] = []
+
+        init(_ text: String) {
+            let composed = text.precomposedStringWithCanonicalMapping
+            // Code units, not `==`: String equality is canonical equivalence, true either way.
+            guard !composed.utf16.elementsEqual(text.utf16) else {
+                subject = text
+                return
+            }
+            // Composed sequence by sequence, so every change stays inside one sequence and the map
+            // is exact by construction. Two ASCII units in a row never compose: skipped cheaply.
+            let original = text as NSString
+            let units = Array(text.utf16)
+            var built = ""
+            var unchangedFrom = 0
+            var location = 0
+            var delta = 0
+            while location < units.count {
+                if units[location] < 0x80, location + 1 == units.count || units[location + 1] < 0x80 {
+                    location += 1
+                    continue
+                }
+                let range = original.rangeOfComposedCharacterSequence(at: location)
+                let piece = original.substring(with: range)
+                let normalized = piece.precomposedStringWithCanonicalMapping
+                if !normalized.utf16.elementsEqual(piece.utf16) {
+                    built += original.substring(
+                        with: NSRange(location: unchangedFrom, length: range.location - unchangedFrom))
+                    built += normalized
+                    let start = range.location + delta
+                    let length = normalized.utf16.count
+                    changed.append((start..<start + length, range.location..<NSMaxRange(range)))
+                    delta += length - range.length
+                    unchangedFrom = NSMaxRange(range)
+                }
+                location = NSMaxRange(range)
+            }
+            subject = built + original.substring(from: unchangedFrom)
+        }
+
+        /// A range in `subject` as one in the original, widened to whole sequences rather than
+        /// splitting one NFC changed.
+        func original(_ range: NSRange) -> NSRange {
+            guard !changed.isEmpty else { return range }
+            let start = offset(range.location, roundingUp: false)
+            let end = offset(NSMaxRange(range), roundingUp: true)
+            return NSRange(location: start, length: end - start)
+        }
+
+        private func offset(_ location: Int, roundingUp: Bool) -> Int {
+            // The last changed sequence starting at or before `location`.
+            var low = 0
+            var high = changed.count
+            while low < high {
+                let middle = (low + high) / 2
+                if changed[middle].subject.lowerBound <= location { low = middle + 1 } else { high = middle }
+            }
+            guard low > 0 else { return location }
+            let (subject, original) = changed[low - 1]
+            if location == subject.lowerBound { return original.lowerBound }
+            if location < subject.upperBound { return roundingUp ? original.upperBound : original.lowerBound }
+            return location + original.upperBound - subject.upperBound
+        }
     }
 
     private func subject(for text: String) -> String {

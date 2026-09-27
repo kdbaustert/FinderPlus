@@ -14,10 +14,9 @@ on:
         description: 'Existing tag to release (e.g. v1.2.0)'
         required: true
 
-# Two releases at once would race on the feed, and one would lose its entry.
-concurrency:
-  group: release
-  cancel-in-progress: false
+# No concurrency group: GitHub keeps one pending run per group and cancels the rest, so pushing
+# several tags at once would drop releases. Instead the feed step below regenerates against the
+# latest feed and retries when another release pushed first.
 
 permissions:
   contents: write
@@ -39,12 +38,21 @@ jobs:
 
       - name: Version from the tag
         id: version
+        # Through env, never an expression pasted into the script: a tag or input is arbitrary text,
+        # and pasted into shell it runs as code in a job holding a write token and the signing key.
+        env:
+          TAG_INPUT: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          TAG="$TAG_INPUT"
+          if [[ ! "$TAG" =~ ^v[0-9]+(\.[0-9]+)*(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::'$TAG' is not a version tag like v1.2.0 or v1.3.0-beta.1"
+            exit 1
+          fi
           VERSION="${TAG#v}"
           # Sparkle offers an update only when its build number is higher, across betas and stable
-          # alike. The commit count only ever grows, so no one has to keep track of it.
+          # alike. The commit count only ever grows, so no one has to keep track of it. release.sh
+          # raises it past the feed's highest when two tags share a commit.
           BUILD="$(git rev-list --count HEAD)"
           BETA=0
           [[ "$VERSION" == *-* ]] && BETA=1
@@ -53,6 +61,36 @@ jobs:
           echo "build=$BUILD" >> "$GITHUB_OUTPUT"
           echo "beta=$BETA" >> "$GITHUB_OUTPUT"
           echo "Releasing $VERSION (build $BUILD, $([[ $BETA == 1 ]] && echo beta || echo stable))"
+
+      # A re-run after a step past `gh release create` failed: the release, and perhaps its zip,
+      # already exist. A rebuilt zip would not match the one uploaded, so the uploaded one is reused.
+      - name: Look for an existing release
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          ASSET_NAME="FinderPlus-$VERSION.zip"
+          # Listed first, so a failed query stops the job rather than reading as "no release".
+          TAGS="$(gh release list --limit 1000 --json tagName --jq '.[].tagName')"
+          if ! grep -Fx -- "$TAG" <<<"$TAGS" >/dev/null; then
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+            echo "reuse=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "exists=1" >> "$GITHUB_OUTPUT"
+          ASSETS="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+          if grep -Fx -- "$ASSET_NAME" <<<"$ASSETS" >/dev/null; then
+            mkdir -p build/releases
+            gh release download "$TAG" --pattern "$ASSET_NAME" --dir build/releases --clobber
+            echo "reuse=1" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG is already released: reusing its $ASSET_NAME instead of rebuilding."
+          else
+            echo "reuse=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG exists without $ASSET_NAME: building it and uploading to that release."
+          fi
 
       - name: Toolchain
         run: |
@@ -87,20 +125,64 @@ jobs:
           fi
           echo "Sparkle key matches Info.plist."
 
+      # A stable signing identity, when the secrets hold one. macOS keys Full Disk Access, Automation
+      # and folder grants to the code signature; ad-hoc, that changes with every build, so every
+      # update drops them. Imported into a throwaway keychain that the last step deletes.
+      - name: Import the code signing identity
+        id: codesign
+        env:
+          CODESIGN_P12_BASE64: ${{ secrets.CODESIGN_P12_BASE64 }}
+          CODESIGN_P12_PASSWORD: ${{ secrets.CODESIGN_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$CODESIGN_P12_BASE64" || -z "$CODESIGN_P12_PASSWORD" ]]; then
+            echo "::warning::CODESIGN_P12_BASE64 and CODESIGN_P12_PASSWORD are not set, so this release is ad-hoc signed: installing it as an update drops the Full Disk Access, Automation and folder permissions people granted. See README, Building."
+            exit 0
+          fi
+          KEYCHAIN="$RUNNER_TEMP/codesign.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          ( umask 077; printf '%s' "$CODESIGN_P12_BASE64" | base64 -D > "$RUNNER_TEMP/codesign.p12" )
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/codesign.p12" -k "$KEYCHAIN" -P "$CODESIGN_P12_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/codesign.p12"
+          # Lets codesign use the key without the permission prompt nobody is there to answer.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          # By SHA-1, which names exactly this certificate. Not -v: a self-signed identity is
+          # untrusted, which -v hides, and codesign signs with it all the same.
+          IDENTITY="$(security find-identity -p codesigning "$KEYCHAIN" | awk '/^ *[0-9]+\) [0-9A-F]+ / && length($2) == 40 { if (!found) found = $2 } END { print found }')"
+          if [[ -z "$IDENTITY" ]]; then
+            echo "::error::CODESIGN_P12_BASE64 holds no code signing identity."
+            exit 1
+          fi
+          echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
+          echo "Signing with $IDENTITY."
+
       # The same suite CI runs, run again here: a tag is its own trigger, so nothing ties it to a
       # green run on the commit it points at.
       - name: Test
         run: swift test
 
       # The same script a release checked by hand runs. It reads the feed so far from gh-pages and
-      # writes the extended one to build/releases/appcast.xml.
+      # writes the extended one to build/releases/appcast.xml. Its build output is the build number
+      # it actually shipped, which it may have raised.
       - name: Build and sign
+        id: release
         env:
           SPARKLE_KEY_FILE: ${{ runner.temp }}/sparkle_key
           VERSION: ${{ steps.version.outputs.version }}
           BUILD: ${{ steps.version.outputs.build }}
+          BETA: ${{ steps.version.outputs.beta }}
+          REUSE: ${{ steps.existing.outputs.reuse }}
+          CODESIGN_IDENTITY: ${{ steps.codesign.outputs.identity }}
         run: |
-          if [[ "${{ steps.version.outputs.beta }}" == "1" ]]; then
+          set -euo pipefail
+          if [[ "$REUSE" == "1" ]]; then
+            export EXISTING_ZIP="build/releases/FinderPlus-$VERSION.zip"
+          fi
+          if [[ "$BETA" == "1" ]]; then
             ./release.sh --beta
           else
             ./release.sh
@@ -111,51 +193,91 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
           VERSION: ${{ steps.version.outputs.version }}
+          BETA: ${{ steps.version.outputs.beta }}
+          EXISTS: ${{ steps.existing.outputs.exists }}
+          REUSE: ${{ steps.existing.outputs.reuse }}
         run: |
           set -euo pipefail
           ASSET="build/releases/FinderPlus-$VERSION.zip"
           [[ -f "$ASSET" ]] || { echo "::error::missing $ASSET"; exit 1; }
+          if [[ "$REUSE" == "1" ]]; then
+            echo "$TAG is already released with this zip."
+            exit 0
+          fi
+          if [[ "$EXISTS" == "1" ]]; then
+            gh release upload "$TAG" "$ASSET"
+            exit 0
+          fi
+          # A beta is a prerelease and never "Latest", or releases/latest would hand it to everyone.
+          PRERELEASE=()
+          if [[ "$BETA" == "1" ]]; then
+            PRERELEASE=(--prerelease --latest=false)
+          fi
           NOTES=$'This build is ad-hoc signed, not notarised — there is no Apple Developer Program\nmembership behind it yet. macOS Gatekeeper will call the download damaged or from an\nunidentified developer on first launch. To open it: right-click FinderPlus.app → Open, or run\n`xattr -cr /path/to/FinderPlus.app` in Terminal.\n\n'
           # --generate-notes adds the changes since the last tag after the notice above.
           gh release create "$TAG" "$ASSET" \
             --title "FinderPlus $VERSION" \
             --notes "$NOTES" \
-            --generate-notes
+            --generate-notes \
+            ${PRERELEASE[@]+"${PRERELEASE[@]}"}
 
       # Last, and only on success: a feed entry pointing at a release that failed to upload is an
       # update every client tries and fails to install.
+      #
+      # Releases run side by side, so the feed built above may be stale by now. Each attempt has
+      # release.sh fetch gh-pages and add this release's zip to the feed as it is now (or check the
+      # entry already there, on a re-run), then commits on top of exactly the commit it read: if
+      # another release pushed in between, the push is rejected and the next attempt starts over.
       - name: Publish the appcast
         env:
+          SPARKLE_KEY_FILE: ${{ runner.temp }}/sparkle_key
           VERSION: ${{ steps.version.outputs.version }}
+          BUILD: ${{ steps.release.outputs.build }}
+          BETA: ${{ steps.version.outputs.beta }}
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          ARGS=()
+          if [[ "$BETA" == "1" ]]; then
+            ARGS=(--beta)
+          fi
 
-          # An orphan branch: the feed has no relationship to the source history, and carrying the
-          # whole tree into Pages would publish the repository as a website by accident.
           WORKTREE="$RUNNER_TEMP/pages"
-          if git ls-remote --exit-code --heads origin gh-pages > /dev/null 2>&1; then
-            git fetch origin gh-pages
-            git worktree add "$WORKTREE" origin/gh-pages
-            git -C "$WORKTREE" checkout -B gh-pages
-          else
-            git worktree add --detach "$WORKTREE"
-            git -C "$WORKTREE" checkout --orphan gh-pages
-            git -C "$WORKTREE" rm -rf . > /dev/null 2>&1 || true
-          fi
+          for attempt in 1 2 3 4 5; do
+            EXISTING_ZIP="build/releases/FinderPlus-$VERSION.zip" ./release.sh ${ARGS[@]+"${ARGS[@]}"}
 
-          cp build/releases/appcast.xml "$WORKTREE/appcast.xml"
-          # Stops Pages running the file through Jekyll, which mangles XML it takes for a template.
-          touch "$WORKTREE/.nojekyll"
+            git worktree remove --force "$WORKTREE" > /dev/null 2>&1 || true
+            # An orphan branch: the feed has no relationship to the source history, and carrying the
+            # whole tree into Pages would publish the repository as a website by accident.
+            # origin/gh-pages is what release.sh just fetched, so the commit sits on what it read.
+            if git rev-parse --verify --quiet refs/remotes/origin/gh-pages > /dev/null; then
+              git worktree add --detach "$WORKTREE" origin/gh-pages
+              git -C "$WORKTREE" checkout -B gh-pages
+            else
+              git worktree add --detach "$WORKTREE"
+              git branch -D gh-pages > /dev/null 2>&1 || true
+              git -C "$WORKTREE" checkout --orphan gh-pages
+              git -C "$WORKTREE" rm -rf . > /dev/null 2>&1 || true
+            fi
 
-          git -C "$WORKTREE" add appcast.xml .nojekyll
-          if git -C "$WORKTREE" diff --cached --quiet; then
-            echo "Appcast unchanged."
-          else
+            cp build/releases/appcast.xml "$WORKTREE/appcast.xml"
+            # Stops Pages running the file through Jekyll, which mangles XML it takes for a template.
+            touch "$WORKTREE/.nojekyll"
+
+            git -C "$WORKTREE" add appcast.xml .nojekyll
+            if git -C "$WORKTREE" diff --cached --quiet; then
+              echo "Appcast unchanged."
+              exit 0
+            fi
             git -C "$WORKTREE" commit -m "Appcast: FinderPlus $VERSION"
-            git -C "$WORKTREE" push origin gh-pages
-          fi
+            if git -C "$WORKTREE" push origin gh-pages; then
+              exit 0
+            fi
+            echo "::warning::gh-pages moved while publishing (attempt $attempt); regenerating the feed."
+          done
+          echo "::error::could not publish the appcast after 5 attempts"
+          exit 1
 
       # release.sh stamped the version into this checkout's Info.plist; this carries it to the
       # default branch, so a local build reports what was last shipped. Last, so a failed release
@@ -165,7 +287,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
-          BUILD: ${{ steps.version.outputs.build }}
+          BUILD: ${{ steps.release.outputs.build }}
           REPO: ${{ github.repository }}
           BRANCH: ${{ github.event.repository.default_branch }}
         run: |
@@ -203,3 +325,12 @@ jobs:
       - name: Remove the signing key file
         if: always()
         run: rm -f "$RUNNER_TEMP/sparkle_key"
+
+      # The same for the code signing identity, if one was imported.
+      - name: Remove the code signing keychain
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/codesign.p12"
+          if [[ -f "$RUNNER_TEMP/codesign.keychain-db" ]]; then
+            security delete-keychain "$RUNNER_TEMP/codesign.keychain-db"
+          fi
