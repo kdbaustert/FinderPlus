@@ -109,3 +109,55 @@ extension SearchOptions {
         includeApplications = value(.includeApplications, defaults.includeApplications)
     }
 }
+
+/// App-wide preferences, edited in the Settings window.
+struct AppSettings: Equatable, Codable, Sendable {
+    enum DoubleClick: String, CaseIterable, Identifiable, Codable, Sendable {
+        case open, reveal, quickLook
+
+        var id: Self { self }
+
+        var title: String {
+            switch self {
+            case .open: "Opens the item"
+            case .reveal: "Shows it in Finder"
+            case .quickLook: "Previews it with Quick Look"
+            }
+        }
+    }
+
+    var doubleClick: DoubleClick = .open
+    var confirmTrash = true
+    var rememberRecents = true
+    var showFullPaths = false
+    var maxContentMegabytes = 50
+    /// 0 means no limit.
+    var maxResults = 0
+    var skippedFolderNames: [String] = []
+
+    var limits: SearchLimits {
+        SearchLimits(
+            maxContentBytes: maxContentMegabytes * 1024 * 1024,
+            maxResults: maxResults,
+            skippedFolderNames: Set(skippedFolderNames))
+    }
+}
+
+extension AppSettings {
+    /// Every key is optional, for the same reason as `SearchOptions`: settings added later must not
+    /// reset the ones already saved.
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let defaults = AppSettings()
+        func value<T: Decodable>(_ key: CodingKeys, _ fallback: T) -> T {
+            (try? container.decodeIfPresent(T.self, forKey: key)) ?? fallback
+        }
+        doubleClick = value(.doubleClick, defaults.doubleClick)
+        confirmTrash = value(.confirmTrash, defaults.confirmTrash)
+        rememberRecents = value(.rememberRecents, defaults.rememberRecents)
+        showFullPaths = value(.showFullPaths, defaults.showFullPaths)
+        maxContentMegabytes = value(.maxContentMegabytes, defaults.maxContentMegabytes)
+        maxResults = value(.maxResults, defaults.maxResults)
+        skippedFolderNames = value(.skippedFolderNames, defaults.skippedFolderNames)
+    }
+}

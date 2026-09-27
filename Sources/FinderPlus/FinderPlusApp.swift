@@ -16,6 +16,11 @@ struct FinderPlusApp: App {
         // The gaps between the glass panels drag the window, as well as the toolbar.
         .windowBackgroundDragBehavior(.enabled)
         .commands { SearchCommands(model: model) }
+
+        Settings {
+            SettingsView()
+                .environment(model)
+        }
     }
 }
 
@@ -27,6 +32,9 @@ struct SearchCommands: Commands {
     let model: SearchModel
 
     var body: some Commands {
+        CommandGroup(replacing: .appInfo) {
+            Button("About FinderPlus") { About.showPanel() }
+        }
         CommandGroup(after: .newItem) {
             Divider()
             Button("Open") { model.open() }

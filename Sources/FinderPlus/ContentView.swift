@@ -2,40 +2,57 @@ import QuickLook
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// A glass toolbar over two floating Liquid Glass panels — search options and results — on a
-/// translucent window and a soft colour field, so the glass has something to refract. A split view
-/// is not used: its sidebar is an opaque system panel that cannot be given a glass shape of our own.
+/// A glass toolbar over the search options and results, on a translucent window with one even tint.
 struct ContentView: View {
     @Environment(SearchModel.self) private var model
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         ZStack {
-            // Under the toolbar too, so its glass has colour behind it.
-            AmbientBackdrop().ignoresSafeArea()
-            HStack(spacing: 10) {
+            // Under the toolbar too, so the toolbar matches everything below it.
+            WindowTint().ignoresSafeArea()
+            HStack(spacing: 0) {
                 if model.showsSidebar {
                     OptionsPanel()
                         .frame(width: 244)
-                        .glassPanel()
+                        .overlay(alignment: .trailing) {
+                            Rectangle()
+                                .fill(.separator)
+                                .frame(width: 1)
+                        }
                         .transition(.move(edge: .leading).combined(with: .opacity))
                 }
-                ResultsView()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .safeAreaBar(edge: .top) { SearchHeader() }
-                    .overlay(alignment: .bottom) {
-                        if model.phase != .idle, !isFailed {
-                            StatusPill()
-                                .padding(.bottom, 14)
-                                .transition(.move(edge: .bottom).combined(with: .opacity))
-                        }
+                // The status sits in its own row under the results. Without a background it cannot
+                // float over them, and the table ignores a safe-area inset, drawing rows beneath it.
+                VStack(spacing: 0) {
+                    ResultsView()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .safeAreaBar(edge: .top) { SearchHeader() }
+                    if model.phase != .idle, !isFailed {
+                        StatusPill()
+                            .transition(.opacity)
                     }
-                    .animation(.spring(duration: 0.35), value: model.phase)
-                    .glassPanel()
+                }
+                .animation(.spring(duration: 0.35), value: model.phase)
+                // The results side a shade darker than the sidebar, edge to edge from its border.
+                .background(Color.black.opacity(colorScheme == .dark ? 0.14 : 0.04))
             }
-            .padding([.horizontal, .bottom], 10)
-            .padding(.top, 4)
+            // A divider under the toolbar, full width. The sidebar and search area start right at it
+            // (their extra breathing room is inside them) so the sidebar's border meets this line.
+            .overlay(alignment: .top) {
+                Rectangle()
+                    .fill(.separator)
+                    .frame(height: 1)
+            }
         }
         .containerBackground(.thinMaterial, for: .window)
+        .sheet(isPresented: Bindable(model).showsFullDiskAccessPrompt) {
+            FullDiskAccessSheet()
+        }
+        .task { model.checkFullDiskAccessAtLaunch() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            model.recheckFullDiskAccess()
+        }
         .navigationTitle("FinderPlus")
         .navigationSubtitle(subtitle)
         .toolbar { toolbar }
@@ -49,6 +66,7 @@ struct ContentView: View {
             }
             .help(model.showsSidebar ? "Hide Search Options (⌃⌘S)" : "Show Search Options (⌃⌘S)")
         }
+        .sharedBackgroundVisibility(.hidden)
 
         // Everything here acts on the selected results, and sits idle until there are some.
         ToolbarItemGroup(placement: .primaryAction) {
@@ -57,6 +75,7 @@ struct ContentView: View {
             action("Show in Finder", symbol: "folder", help: "Show in Finder (⌘R)") { model.reveal() }
             action("Copy Path", symbol: "doc.on.doc", help: "Copy Path (⌥⌘C)") { model.copyPaths() }
         }
+        .sharedBackgroundVisibility(.hidden)
         ToolbarSpacer(.fixed, placement: .primaryAction)
         ToolbarItemGroup(placement: .primaryAction) {
             ShareLink(items: model.selectedURLs) {
@@ -68,6 +87,7 @@ struct ContentView: View {
                 Task { await model.trash() }
             }
         }
+        .sharedBackgroundVisibility(.hidden)
     }
 
     private func action(_ title: String, symbol: String, help: String, perform: @escaping () -> Void) -> some View {
@@ -93,38 +113,15 @@ struct ContentView: View {
     }
 }
 
-extension View {
-    /// A floating Liquid Glass panel. Content is clipped to the same shape so table rows and
-    /// scroll edges stop at the rounded corners instead of poking past the glass.
-    func glassPanel(cornerRadius: CGFloat = 24) -> some View {
-        clipShape(.rect(cornerRadius: cornerRadius))
-            .glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
-    }
-}
-
-/// Static colour behind the panels. Glass over a flat fill reads as grey plastic; it needs light
-/// and colour underneath to look like glass. Rendered once — nothing here animates.
-struct AmbientBackdrop: View {
+/// One even tint over the translucent window, the same everywhere — sidebar, results and toolbar —
+/// so no area reads as highlighted against another. It is what makes the glass a little darker.
+struct WindowTint: View {
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        GeometryReader { proxy in
-            let size = proxy.size
-            ZStack {
-                Circle().fill(Color.accentColor)
-                    .frame(width: size.width * 0.55)
-                    .position(x: size.width * 0.12, y: size.height * 0.1)
-                Circle().fill(Color.purple)
-                    .frame(width: size.width * 0.5)
-                    .position(x: size.width * 0.9, y: size.height * 0.95)
-                Circle().fill(Color.teal)
-                    .frame(width: size.width * 0.4)
-                    .position(x: size.width * 0.75, y: size.height * 0.05)
-            }
-            .blur(radius: 110)
-            .opacity(colorScheme == .dark ? 0.45 : 0.3)
-        }
-        .allowsHitTesting(false)
+        Color.black
+            .opacity(colorScheme == .dark ? 0.22 : 0.07)
+            .allowsHitTesting(false)
     }
 }
 
@@ -133,13 +130,11 @@ struct AmbientBackdrop: View {
 struct SearchHeader: View {
     @Environment(SearchModel.self) private var model
     @FocusState private var fieldFocused: Bool
-    @Namespace private var glass
 
     var body: some View {
         @Bindable var model = model
         VStack(alignment: .leading, spacing: 6) {
-            GlassEffectContainer(spacing: 12) {
-                HStack(spacing: 12) {
+            HStack(spacing: 12) {
                     HStack(spacing: 10) {
                         Image(systemName: model.options.searchContents ? "doc.text.magnifyingglass" : "magnifyingglass")
                             .font(.title3)
@@ -176,15 +171,13 @@ struct SearchHeader: View {
                     .padding(.horizontal, 16)
                     .frame(height: 44)
                     .glassEffect(.regular.interactive(), in: .capsule)
-                    .glassEffectID("field", in: glass)
 
                     if model.isSearching {
                         Button(role: .cancel) { model.stop() } label: {
                             Label("Stop", systemImage: "stop.fill").padding(.horizontal, 4)
                         }
-                        .buttonStyle(.glass)
-                        .controlSize(.extraLarge)
-                        .glassEffectID("action", in: glass)
+                        .buttonStyle(.borderless)
+                        .controlSize(.large)
                     } else {
                         Button { model.start() } label: {
                             Label("Find", systemImage: "arrow.forward").padding(.horizontal, 4)
@@ -192,9 +185,7 @@ struct SearchHeader: View {
                         .buttonStyle(.glassProminent)
                         .controlSize(.extraLarge)
                         .disabled(model.query.trimmingCharacters(in: .whitespaces).isEmpty || !model.options.searchesAnyField)
-                        .glassEffectID("action", in: glass)
                     }
-                }
             }
             if !model.showsSidebar {
                 // With the panel hidden, what the search will do is otherwise invisible.
@@ -206,7 +197,7 @@ struct SearchHeader: View {
             }
         }
         .padding(.horizontal, 14)
-        .padding(.top, 12)
+        .padding(.top, 24)
         .padding(.bottom, 10)
         .animation(.smooth(duration: 0.3), value: model.isSearching)
         .animation(.spring(duration: 0.4, bounce: 0.15), value: model.showsSidebar)
@@ -271,7 +262,9 @@ struct OptionsPanel: View {
                     }
                     .pickerStyle(.radioGroup)
                     .labelsHidden()
-                    Divider().padding(.vertical, 2)
+                    Divider()
+                        .padding(.top, 10)
+                        .padding(.bottom, 2)
                     Toggle("Name", isOn: $model.options.searchNames)
                     Toggle("Contents", isOn: $model.options.searchContents)
                         .help("Read inside text files, PDFs and word-processor documents.")
@@ -318,11 +311,14 @@ struct OptionsPanel: View {
             }
             .toggleStyle(.checkbox)
             .padding(.horizontal, 14)
-            .padding(.top, 16)
+            .padding(.top, 28)
             .padding(.bottom, 16)
             .animation(.snappy, value: model.options)
         }
         .scrollIndicators(.never)
+        // Otherwise the toolbar tints a band above this scroll view, giving the title and the
+        // traffic lights a different background from the rest of the toolbar.
+        .scrollEdgeEffectHidden(true, for: .top)
         .dropDestination(for: URL.self) { urls, _ in
             model.addFolders(urls)
             return true
@@ -330,7 +326,7 @@ struct OptionsPanel: View {
     }
 }
 
-/// A titled group of options on a subtle card, in the manner of System Settings.
+/// A titled group of options.
 struct OptionSection<Content: View>: View {
     let title: String
     @ViewBuilder let content: Content
@@ -350,8 +346,7 @@ struct OptionSection<Content: View>: View {
                 content
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(10)
-            .background(.quaternary.opacity(0.45), in: .rect(cornerRadius: 12))
+            .padding(.leading, 4)
         }
     }
 }
@@ -400,7 +395,7 @@ struct LocationMenu: View {
         .frame(maxWidth: .infinity)
         .controlSize(.large)
         .menuIndicator(.hidden)
-        // Overlaid rather than in the label: the glass menu button keeps only a label's icon and title.
+        // Overlaid rather than in the label: a menu button keeps only a label's icon and title.
         .overlay(alignment: .trailing) {
             Image(systemName: "chevron.up.chevron.down")
                 .font(.caption.weight(.semibold))
@@ -489,7 +484,7 @@ struct ResultsView: View {
             // last column, pushed past the right edge.
             TableColumn("Location", value: \.parentPath) { hit in
                 Label {
-                    Text(hit.displayParent)
+                    Text(model.settings.showFullPaths ? hit.parentPath : hit.displayParent)
                         .lineLimit(1)
                         .truncationMode(.middle)
                 } icon: {
@@ -536,8 +531,10 @@ struct ResultsView: View {
                 TableRow(hit).draggable(hit.url)
             }
         }
-        // Transparent, so rows sit directly on the panel's glass.
+        // Transparent, so rows sit directly on the window's glass.
         .scrollContentBackground(.hidden)
+        // No toolbar band above the table either, so the whole toolbar is one even surface.
+        .scrollEdgeEffectHidden(true, for: .top)
         .alternatingRowBackgrounds(.disabled)
         .focused($tableFocused)
         .onChange(of: model.resultsFocusRequest) {
@@ -547,7 +544,7 @@ struct ResultsView: View {
         .contextMenu(forSelectionType: URL.self) { ids in
             ResultMenu(ids: ids)
         } primaryAction: { ids in
-            model.open(ids)
+            model.performDefaultAction(ids)
         }
         .onKeyPress(.space) {
             model.toggleQuickLook()
@@ -585,7 +582,6 @@ struct ResultsView: View {
         var text = AttributedString(snippet.text)
         if let range = Range(snippet.match, in: snippet.text), let span = Range(range, in: text) {
             text[span].foregroundColor = .primary
-            text[span].backgroundColor = Color.accentColor.opacity(0.25)
             text[span].font = .body.weight(.semibold)
         }
         return text
@@ -633,6 +629,10 @@ struct StatusPill: View {
                 Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
                 Text("\(model.results.count.formatted()) matches in \(Self.format(duration)) · \(model.scanned.formatted()) scanned")
                     .monospacedDigit()
+                if model.reachedLimit {
+                    Text("Stopped at the match limit — change it in Settings")
+                        .foregroundStyle(.secondary)
+                }
             case .stopped:
                 Image(systemName: "stop.circle.fill").foregroundStyle(.orange)
                 Text("Stopped · \(model.results.count.formatted()) matches")
@@ -641,8 +641,7 @@ struct StatusPill: View {
             }
             if model.unreadable > 0 {
                 Button {
-                    let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
-                    if let url { NSWorkspace.shared.open(url) }
+                    SearchModel.openFullDiskAccessSettings()
                 } label: {
                     Label("\(model.unreadable) unreadable", systemImage: "lock.fill")
                 }
@@ -652,9 +651,12 @@ struct StatusPill: View {
             }
         }
         .font(.callout)
-        .padding(.horizontal, 18)
-        .padding(.vertical, 10)
-        .glassEffect(.regular, in: .capsule)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .overlay(alignment: .top) {
+            Rectangle().fill(.separator).frame(height: 1)
+        }
         .animation(.smooth, value: model.results.count)
     }
 

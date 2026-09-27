@@ -156,15 +156,48 @@ final class SearchEngineTests: XCTestCase {
         try? FileManager.default.removeItem(at: root)
     }
 
-    private func search(_ query: String, _ configure: (inout SearchOptions) -> Void = { _ in }) throws -> [FileHit] {
+    private func search(
+        _ query: String, limits: SearchLimits = SearchLimits(),
+        _ configure: (inout SearchOptions) -> Void = { _ in }
+    ) throws -> [FileHit] {
         var options = SearchOptions()
         configure(&options)
-        let request = try SearchRequest(roots: [root], query: query, options: options)
+        let request = try SearchRequest(roots: [root], query: query, options: options, limits: limits)
         var hits: [FileHit] = []
         SearchEngine.walk(request) { event in
             if case .hits(let batch) = event { hits += batch }
         }
         return hits.sorted { $0.name < $1.name }
+    }
+
+    func testSkippedFolderNamesAreNeverSearched() throws {
+        XCTAssertEqual(try search("march").map(\.name), ["march.txt"])
+        XCTAssertEqual(try search("march", limits: SearchLimits(skippedFolderNames: ["INVOICES"])), [])
+    }
+
+    func testMatchLimitStopsTheWalk() throws {
+        var options = SearchOptions()
+        options.kind = .files
+        let request = try SearchRequest(
+            roots: [root], query: "t", options: options, limits: SearchLimits(maxResults: 2))
+        var hits = 0
+        var stopped = false
+        SearchEngine.walk(request) { event in
+            if case .hits(let batch) = event { hits += batch.count }
+            if case .limitReached = event { stopped = true }
+        }
+        XCTAssertEqual(hits, 2)
+        XCTAssertTrue(stopped)
+    }
+
+    func testContentSizeLimitSkipsBiggerFiles() throws {
+        let big = root.appending(path: "Projects/big.txt")
+        try (String(repeating: "filler ", count: 200_000) + "needle").write(to: big, atomically: true, encoding: .utf8)
+        func contents(_ limits: SearchLimits) throws -> [String] {
+            try search("needle", limits: limits) { $0.searchNames = false; $0.searchContents = true }.map(\.name)
+        }
+        XCTAssertEqual(try contents(SearchLimits()), ["big.txt"])
+        XCTAssertEqual(try contents(SearchLimits(maxContentBytes: 1024 * 1024)), [])
     }
 
     func testNameSearchFindsFoldersAndSkipsHidden() throws {
@@ -289,5 +322,69 @@ final class SearchModelTests: XCTestCase {
         XCTAssertEqual(model.results.map(\.name), ["invoice-april.txt", "invoice-march.txt"])
         try await finish(model)
         XCTAssertEqual(model.results.map(\.name), ["invoice-april.txt", "invoice-march.txt"])
+    }
+}
+
+final class TrashPermissionTests: XCTestCase {
+    func testRecognisesPermissionErrors() {
+        XCTAssertTrue(SearchModel.isPermissionError(NSError(domain: NSCocoaErrorDomain, code: NSFileWriteNoPermissionError)))
+        XCTAssertTrue(SearchModel.isPermissionError(NSError(domain: NSPOSIXErrorDomain, code: Int(EPERM))))
+        let wrapped = NSError(domain: NSCocoaErrorDomain, code: NSFileWriteUnknownError,
+                              userInfo: [NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES))])
+        XCTAssertTrue(SearchModel.isPermissionError(wrapped))
+        XCTAssertFalse(SearchModel.isPermissionError(NSError(domain: NSCocoaErrorDomain, code: NSFileNoSuchFileError)))
+    }
+
+    func testARealRefusalIsRecognised() throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "FinderPlusLocked-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let file = folder.appending(path: "keep.txt")
+        try "x".write(to: file, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: folder.path)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: folder.path)
+            try? FileManager.default.removeItem(at: folder)
+        }
+        XCTAssertThrowsError(try FileManager.default.trashItem(at: file, resultingItemURL: nil)) { error in
+            XCTAssertTrue(SearchModel.isPermissionError(error), "\(error)")
+        }
+    }
+}
+
+final class AppSettingsTests: XCTestCase {
+    func testSettingsSavedBeforeANewSettingStillLoad() throws {
+        let saved = Data(#"{"doubleClick":"reveal","maxResults":1000}"#.utf8)
+        let settings = try JSONDecoder().decode(AppSettings.self, from: saved)
+        XCTAssertEqual(settings.doubleClick, .reveal)
+        XCTAssertEqual(settings.maxResults, 1000)
+        XCTAssertTrue(settings.confirmTrash)
+        XCTAssertEqual(settings.maxContentMegabytes, 50)
+    }
+
+    func testLimitsCarryTheSettings() {
+        var settings = AppSettings()
+        settings.maxContentMegabytes = 10
+        settings.skippedFolderNames = ["node_modules"]
+        XCTAssertEqual(settings.limits.maxContentBytes, 10 * 1024 * 1024)
+        XCTAssertEqual(settings.limits.skippedFolderNames, ["node_modules"])
+    }
+}
+
+final class FullDiskAccessTests: XCTestCase {
+    func testReadableRefusedAndMissingProbes() throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "FinderPlusFDA-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let readable = folder.appending(path: "open.db").path
+        let locked = folder.appending(path: "locked.db").path
+        let missing = folder.appending(path: "missing.db").path
+        try "x".write(toFile: readable, atomically: true, encoding: .utf8)
+        try "x".write(toFile: locked, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: locked)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: locked) }
+
+        XCTAssertTrue(SearchModel.hasFullDiskAccess(probing: [missing, readable]))
+        XCTAssertFalse(SearchModel.hasFullDiskAccess(probing: [missing, locked, readable]))
+        XCTAssertTrue(SearchModel.hasFullDiskAccess(probing: [missing]), "nothing to test: never nag")
     }
 }

@@ -136,6 +136,7 @@ final class SearchModel {
         static let folders = "customFolders"
         static let location = "location"
         static let recents = "recentQueries"
+        static let settings = "settings"
     }
 
     var query = ""
@@ -143,6 +144,7 @@ final class SearchModel {
     var customLocations: [SearchLocation] { didSet { save(customLocations, Key.folders) } }
     var locationID: String { didSet { save(locationID, Key.location) } }
     private(set) var recentQueries: [String] { didSet { save(recentQueries, Key.recents) } }
+    var settings: AppSettings { didSet { save(settings, Key.settings) } }
 
     var results: [FileHit] = []
     var selection: Set<URL> = []
@@ -160,6 +162,10 @@ final class SearchModel {
     private(set) var unreadable = 0
     /// Whether the results on screen came from a search that read file contents.
     private(set) var searchedContents = false
+    /// The last search stopped at the match limit from Settings.
+    private(set) var reachedLimit = false
+    /// The launch-time panel explaining Full Disk Access.
+    var showsFullDiskAccessPrompt = false
 
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private var searchTask: Task<Void, Never>?
@@ -180,6 +186,7 @@ final class SearchModel {
         customLocations = Self.load([SearchLocation].self, Key.folders, defaults) ?? []
         locationID = Self.load(String.self, Key.location, defaults) ?? NSHomeDirectory()
         recentQueries = Self.load([String].self, Key.recents, defaults) ?? []
+        settings = Self.load(AppSettings.self, Key.settings, defaults) ?? AppSettings()
     }
 
     var isSearching: Bool { phase == .searching }
@@ -197,7 +204,7 @@ final class SearchModel {
         searchTask?.cancel()
         let request: SearchRequest
         do {
-            request = try SearchRequest(roots: searchRoots(), query: query, options: options)
+            request = try SearchRequest(roots: searchRoots(), query: query, options: options, limits: settings.limits)
         } catch QueryError.empty {
             results = []
             phase = .idle
@@ -224,6 +231,7 @@ final class SearchModel {
         selection.formIntersection(knownIDs)
         scanned = 0
         unreadable = 0
+        reachedLimit = false
         currentPath = ""
         searchedContents = options.searchContents
         phase = .searching
@@ -290,6 +298,8 @@ final class SearchModel {
             self.scanned = scanned
             self.unreadable = unreadable
             currentPath = current
+        case .limitReached:
+            reachedLimit = true
         }
     }
 
@@ -339,6 +349,7 @@ final class SearchModel {
     }
 
     private func remember(_ query: String) {
+        guard settings.rememberRecents else { return }
         let trimmed = query.trimmingCharacters(in: .whitespaces)
         recentQueries = [trimmed] + recentQueries.filter { $0 != trimmed }.prefix(11)
     }
@@ -372,6 +383,15 @@ final class SearchModel {
         return results.lazy.map(\.url).filter(ids.contains)
     }
 
+    /// Double-clicking a result, as chosen in Settings.
+    func performDefaultAction(_ ids: Set<URL>) {
+        switch settings.doubleClick {
+        case .open: open(ids)
+        case .reveal: reveal(ids)
+        case .quickLook: previewURL = targets(ids).first
+        }
+    }
+
     func open(_ ids: Set<URL>? = nil) {
         for url in targets(ids) { NSWorkspace.shared.open(url) }
     }
@@ -393,13 +413,129 @@ final class SearchModel {
     func trash(_ ids: Set<URL>? = nil) async {
         let urls = targets(ids)
         guard !urls.isEmpty else { return }
-        do {
-            let trashed = Set(try await NSWorkspace.shared.recycle(urls).keys)
-            results.removeAll { trashed.contains($0.url) }
-            selection.subtract(trashed)
-        } catch {
-            NSApp.presentError(error)
+        if settings.confirmTrash {
+            let alert = NSAlert()
+            alert.messageText = "Move \(Self.describe(urls)) to the Trash?"
+            alert.informativeText = "You can put it back from the Trash in Finder."
+            alert.addButton(withTitle: "Move to Trash")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
         }
+        let outcome = await Self.recycle(urls)
+        results.removeAll { outcome.trashed.contains($0.url) }
+        selection.subtract(outcome.trashed)
+
+        let refused = urls.filter { !outcome.trashed.contains($0) }
+        guard !refused.isEmpty else { return }
+        if outcome.deniedByPermissions {
+            explainTrashPermission(for: refused)
+        } else if let message = outcome.message {
+            let alert = NSAlert()
+            alert.messageText = "Couldn’t move \(Self.describe(refused)) to the Trash"
+            alert.informativeText = message
+            alert.runModal()
+        }
+    }
+
+    private struct RecycleOutcome: Sendable {
+        var trashed: Set<URL>
+        var deniedByPermissions: Bool
+        var message: String?
+    }
+
+    /// The completion-handler form rather than `async throws`: that one throws away the files that
+    /// did reach the Trash whenever any file in the batch fails.
+    private static func recycle(_ urls: [URL]) async -> RecycleOutcome {
+        await withCheckedContinuation { continuation in
+            NSWorkspace.shared.recycle(urls) { moved, error in
+                continuation.resume(returning: RecycleOutcome(
+                    trashed: Set(moved.keys),
+                    deniedByPermissions: error.map(isPermissionError) ?? false,
+                    message: error?.localizedDescription))
+            }
+        }
+    }
+
+    nonisolated static func isPermissionError(_ error: any Error) -> Bool {
+        let error = error as NSError
+        let cocoa = error.domain == NSCocoaErrorDomain
+            && [NSFileWriteNoPermissionError, NSFileReadNoPermissionError].contains(error.code)
+        let posix = error.domain == NSPOSIXErrorDomain && [Int(EPERM), Int(EACCES)].contains(error.code)
+        let underlying = (error.userInfo[NSUnderlyingErrorKey] as? NSError).map(isPermissionError) ?? false
+        return cocoa || posix || underlying
+    }
+
+    /// macOS refuses to trash files in protected places until FinderPlus has Full Disk Access; files
+    /// owned by the system need Finder, which can ask for an administrator password.
+    private func explainTrashPermission(for urls: [URL]) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "FinderPlus needs Full Disk Access to delete \(Self.describe(urls))"
+        alert.informativeText = """
+            macOS blocked the move to the Trash. Turn on FinderPlus in System Settings › Privacy & \
+            Security › Full Disk Access, then try again.
+
+            Files that belong to macOS itself can only be deleted in Finder, which asks for an \
+            administrator password.
+            """
+        alert.addButton(withTitle: "Open Full Disk Access Settings")
+        alert.addButton(withTitle: "Show in Finder")
+        alert.addButton(withTitle: "Cancel")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            Self.openFullDiskAccessSettings()
+        case .alertSecondButtonReturn:
+            NSWorkspace.shared.activateFileViewerSelecting(urls)
+        default:
+            break
+        }
+    }
+
+    // MARK: - Full Disk Access
+
+    func checkFullDiskAccessAtLaunch() {
+        showsFullDiskAccessPrompt = !Self.hasFullDiskAccess()
+    }
+
+    /// Returning from System Settings: the panel closes itself once access is on.
+    func recheckFullDiskAccess() {
+        if showsFullDiskAccessPrompt && Self.hasFullDiskAccess() {
+            showsFullDiskAccessPrompt = false
+        }
+    }
+
+    /// macOS offers no call that answers this, so it is tested directly: these files exist on every
+    /// Mac and open only with Full Disk Access. A missing file is skipped; a refusal means no
+    /// access. When nothing can be tested the answer is yes, so the app never nags without cause.
+    nonisolated static func hasFullDiskAccess(probing probes: [String] = fullDiskAccessProbes) -> Bool {
+        for path in probes {
+            let descriptor = Darwin.open(path, O_RDONLY)
+            if descriptor >= 0 {
+                Darwin.close(descriptor)
+                return true
+            }
+            if errno == EPERM || errno == EACCES { return false }
+        }
+        return true
+    }
+
+    nonisolated static let fullDiskAccessProbes: [String] = {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return [
+            home + "/Library/Application Support/com.apple.TCC/TCC.db",
+            "/Library/Application Support/com.apple.TCC/TCC.db",
+            home + "/Library/Safari/Bookmarks.plist",
+        ]
+    }()
+
+    static func openFullDiskAccessSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private static func describe(_ urls: [URL]) -> String {
+        urls.count == 1 ? "“\(urls[0].lastPathComponent)”" : "\(urls.count) items"
     }
 
     // MARK: - Persistence

@@ -31,6 +31,18 @@ struct FileHit: Identifiable, Hashable, Sendable {
 enum SearchEvent: Sendable {
     case hits([FileHit])
     case progress(scanned: Int, current: String, unreadable: Int)
+    /// The match limit from Settings was reached and the walk stopped early.
+    case limitReached
+}
+
+/// The parts of Settings that change what a search does. The defaults are the behaviour before
+/// Settings existed.
+struct SearchLimits: Equatable, Sendable {
+    var maxContentBytes = 50 * 1024 * 1024
+    /// 0 means no limit.
+    var maxResults = 0
+    /// Folder names skipped wherever they appear, compared case-insensitively.
+    var skippedFolderNames: Set<String> = []
 }
 
 struct SearchRequest: Sendable {
@@ -40,10 +52,15 @@ struct SearchRequest: Sendable {
     /// For contents and comments, where it means a fragment.
     let textMatcher: QueryMatcher
     let options: SearchOptions
+    let limits: SearchLimits
 
-    init(roots: [URL], query: String, options: SearchOptions) throws {
+    init(roots: [URL], query: String, options: SearchOptions, limits: SearchLimits = SearchLimits()) throws {
         self.roots = roots
         self.options = options
+        self.limits = SearchLimits(
+            maxContentBytes: limits.maxContentBytes,
+            maxResults: limits.maxResults,
+            skippedFolderNames: Set(limits.skippedFolderNames.map { $0.lowercased() }))
         nameMatcher = try QueryMatcher(query: query, options: options, anchorsWildcards: true)
         textMatcher = try QueryMatcher(query: query, options: options, anchorsWildcards: false)
     }
@@ -52,7 +69,6 @@ struct SearchRequest: Sendable {
 /// A live, index-free walk of the file system, like EasyFind's: slower than Spotlight, but it sees
 /// hidden, system and never-indexed files.
 enum SearchEngine {
-    static let maxContentBytes = 50 * 1024 * 1024
 
     private static let resourceKeys: Set<URLResourceKey> = [
         .isDirectoryKey, .isPackageKey, .isRegularFileKey, .fileSizeKey, .contentModificationDateKey,
@@ -91,13 +107,21 @@ enum SearchEngine {
         var candidates: [FileHit] = []
         var kinds: [String: String] = [:]
         var scanned = 0
+        var reported = 0
+        var reachedLimit = false
         var lastFlush = ContinuousClock.now
+        let limits = request.limits
 
         func flush(current: String, force: Bool = false) {
             let now = ContinuousClock.now
             guard force || now - lastFlush >= .milliseconds(120) else { return }
             lastFlush = now
+            if limits.maxResults > 0, reported + pending.count >= limits.maxResults {
+                pending = Array(pending.prefix(limits.maxResults - reported))
+                reachedLimit = true
+            }
             if !pending.isEmpty {
+                reported += pending.count
                 emit(.hits(pending))
                 pending.removeAll(keepingCapacity: true)
             }
@@ -111,7 +135,7 @@ enum SearchEngine {
             let found = OSAllocatedUnfairLock(initialState: [FileHit]())
             DispatchQueue.concurrentPerform(iterations: batch.count) { index in
                 var hit = batch[index]
-                guard let text = contentText(of: hit.url, size: hit.size),
+                guard let text = contentText(of: hit.url, size: hit.size, maxBytes: limits.maxContentBytes),
                       let snippet = request.textMatcher.snippet(in: text)
                 else { return }
                 hit.snippet = snippet
@@ -150,7 +174,9 @@ enum SearchEngine {
                 scanned += 1
                 guard let values = try? url.resourceValues(forKeys: resourceKeys) else { continue }
                 let isDirectory = values.isDirectory ?? false
-                if isDirectory && shouldSkipDirectory(url, rootPath: rootPath, options: options) {
+                if isDirectory && (shouldSkipDirectory(url, rootPath: rootPath, options: options)
+                    || limits.skippedFolderNames.contains(url.lastPathComponent.lowercased()))
+                {
                     enumerator.skipDescendants()
                     continue
                 }
@@ -192,10 +218,15 @@ enum SearchEngine {
                     }
                 }
                 flush(current: url.path)
+                if reachedLimit {
+                    emit(.limitReached)
+                    return
+                }
             }
             searchCandidateContents()
         }
         flush(current: "", force: true)
+        if reachedLimit { emit(.limitReached) }
     }
 
     /// Folders pruned before the walk descends into them. `rootPath` is the resolved root being
@@ -240,8 +271,8 @@ enum SearchEngine {
 
     /// Plain text, PDF and word-processor documents. Anything else is sniffed: no NUL bytes in the
     /// first 8 KB means it is treated as text, which catches source files with unknown extensions.
-    static func contentText(of url: URL, size: Int64) -> String? {
-        guard size > 0, size <= maxContentBytes else { return nil }
+    static func contentText(of url: URL, size: Int64, maxBytes: Int = SearchLimits().maxContentBytes) -> String? {
+        guard size > 0, size <= maxBytes else { return nil }
         // An iCloud file that is not downloaded is a placeholder, and reading it downloads it — a
         // content search of iCloud Drive would otherwise pull the whole drive down.
         var info = stat()
