@@ -134,6 +134,45 @@ enum LocationError: LocalizedError {
     }
 }
 
+/// The state every window shares and the Settings window edits: preferences, recent searches, and
+/// the folders added to the Location menu. One instance backs every window's `SearchModel`, so a
+/// change made anywhere shows everywhere at once — and so two windows never save stale copies of
+/// the same list over each other's.
+@MainActor
+@Observable
+final class Preferences {
+    static let shared = Preferences()
+
+    private enum Key {
+        static let settings = "settings"
+        static let recents = "recentQueries"
+        static let folders = "customFolders"
+    }
+
+    var settings: AppSettings { didSet { defaults.saveJSON(settings, Key.settings) } }
+    private(set) var recentQueries: [String] { didSet { defaults.saveJSON(recentQueries, Key.recents) } }
+    var customLocations: [SearchLocation] { didSet { defaults.saveJSON(customLocations, Key.folders) } }
+
+    @ObservationIgnored private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        settings = defaults.loadJSON(AppSettings.self, Key.settings) ?? AppSettings()
+        recentQueries = defaults.loadJSON([String].self, Key.recents) ?? []
+        customLocations = defaults.loadJSON([SearchLocation].self, Key.folders) ?? []
+    }
+
+    func remember(_ query: String) {
+        guard settings.rememberRecents else { return }
+        let trimmed = query.trimmingCharacters(in: .whitespaces)
+        recentQueries = [trimmed] + recentQueries.filter { $0 != trimmed }.prefix(11)
+    }
+
+    func clearRecents() {
+        recentQueries = []
+    }
+}
+
 @MainActor
 @Observable
 final class SearchModel {
@@ -143,20 +182,29 @@ final class SearchModel {
 
     private enum Key {
         static let options = "options"
-        static let folders = "customFolders"
         static let location = "location"
-        static let recents = "recentQueries"
-        static let settings = "settings"
         static let sort = "sortOrder"
         static let preview = "showsPreview"
     }
 
+    /// The app-wide state behind this window — see `Preferences`.
+    let preferences: Preferences
+
     var query = ""
     var options: SearchOptions { didSet { save(options, Key.options) } }
-    var customLocations: [SearchLocation] { didSet { save(customLocations, Key.folders) } }
     var locationID: String { didSet { save(locationID, Key.location) } }
-    private(set) var recentQueries: [String] { didSet { save(recentQueries, Key.recents) } }
-    var settings: AppSettings { didSet { save(settings, Key.settings) } }
+
+    /// Passthroughs to the shared state, so every existing call site and binding keeps working.
+    /// Computed, so `@Observable` views track the shared store itself rather than a copy here.
+    var settings: AppSettings {
+        get { preferences.settings }
+        set { preferences.settings = newValue }
+    }
+    var customLocations: [SearchLocation] {
+        get { preferences.customLocations }
+        set { preferences.customLocations = newValue }
+    }
+    var recentQueries: [String] { preferences.recentQueries }
 
     var results: [FileHit] = []
     var selection: Set<FileHit.ID> = []
@@ -214,13 +262,11 @@ final class SearchModel {
         let limits: SearchLimits
     }
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, preferences: Preferences? = nil) {
         self.defaults = defaults
+        self.preferences = preferences ?? Preferences(defaults: defaults)
         options = Self.load(SearchOptions.self, Key.options, defaults) ?? SearchOptions()
-        customLocations = Self.load([SearchLocation].self, Key.folders, defaults) ?? []
         locationID = Self.load(String.self, Key.location, defaults) ?? NSHomeDirectory()
-        recentQueries = Self.load([String].self, Key.recents, defaults) ?? []
-        settings = Self.load(AppSettings.self, Key.settings, defaults) ?? AppSettings()
         sortOrder = [Self.comparator(for: Self.load(SavedSort.self, Key.sort, defaults) ?? SavedSort())]
         showsPreview = defaults.bool(forKey: Key.preview)
     }
@@ -484,13 +530,11 @@ final class SearchModel {
     }
 
     private func remember(_ query: String) {
-        guard settings.rememberRecents else { return }
-        let trimmed = query.trimmingCharacters(in: .whitespaces)
-        recentQueries = [trimmed] + recentQueries.filter { $0 != trimmed }.prefix(11)
+        preferences.remember(query)
     }
 
     func clearRecents() {
-        recentQueries = []
+        preferences.clearRecents()
     }
 
     // MARK: - Locations
@@ -812,6 +856,83 @@ final class SearchModel {
         return candidate
     }
 
+    // MARK: - Rename
+
+    /// The rows the Rename sheet is open for, or nil.
+    var renameRequest: RenameRequest?
+
+    /// Opens the Rename sheet for the rows, or the selection. Entries inside archives are left
+    /// out: they have no file of their own to rename.
+    func requestRename(_ ids: Set<FileHit.ID>? = nil) {
+        let files = hits(ids).filter { !$0.isArchiveEntry }
+        guard !files.isEmpty else {
+            NSSound.beep()
+            return
+        }
+        renameRequest = RenameRequest(hits: files)
+    }
+
+    /// Renames files in place, then updates their rows — selection included, so the renamed files
+    /// stay selected under their new IDs.
+    func rename(_ steps: [RenameStep]) async {
+        guard !steps.isEmpty else { return }
+        let outcome = await Task.detached { Self.performRename(steps) }.value
+        if !outcome.done.isEmpty {
+            let renamed = Dictionary(uniqueKeysWithValues: outcome.done.map { ($0.key.path, $0.value.path) })
+            results = results.map { hit in
+                guard !hit.isArchiveEntry, let moved = outcome.done[hit.url] else { return hit }
+                return FileHit(
+                    url: moved, name: moved.lastPathComponent, isFolder: hit.isFolder, size: hit.size,
+                    modified: hit.modified, created: hit.created, kind: hit.kind, snippet: hit.snippet)
+            }
+            selection = Set(selection.map { renamed[$0] ?? $0 })
+            knownIDs = Set(results.map(\.id))
+            resort()
+        }
+        guard !outcome.failed.isEmpty else { return }
+        let refused = steps.map(\.source).filter { outcome.done[$0] == nil }
+        if outcome.deniedByPermissions {
+            explainPermission(toDo: "rename", refused)
+        } else {
+            let alert = NSAlert()
+            alert.messageText = "Couldn’t rename \(Self.describe(refused))"
+            alert.informativeText = outcome.failed.joined(separator: "\n")
+            alert.runModal()
+        }
+    }
+
+    /// Every file is parked under a temporary name before any lands under its new one, so a batch
+    /// that permutes names — renumbering 1, 2, 3 the other way round — never collides with a file
+    /// later in the same batch.
+    nonisolated static func performRename(_ steps: [RenameStep]) -> TransferOutcome {
+        let manager = FileManager.default
+        var outcome = TransferOutcome()
+        var parked: [(holding: URL, step: RenameStep)] = []
+        for step in steps {
+            let holding = step.source.deletingLastPathComponent()
+                .appending(path: ".FinderPlus-rename-" + UUID().uuidString)
+            do {
+                try manager.moveItem(at: step.source, to: holding)
+                parked.append((holding, step))
+            } catch {
+                outcome.failed.append("\(step.source.lastPathComponent): \(error.localizedDescription)")
+                if isPermissionError(error) { outcome.deniedByPermissions = true }
+            }
+        }
+        for (holding, step) in parked {
+            do {
+                try manager.moveItem(at: holding, to: step.target)
+                outcome.done[step.source] = step.target
+            } catch {
+                // Back under its old name: a failure must never leave a file parked invisibly.
+                try? manager.moveItem(at: holding, to: step.source)
+                outcome.failed.append("\(step.source.lastPathComponent): \(error.localizedDescription)")
+                if isPermissionError(error) { outcome.deniedByPermissions = true }
+            }
+        }
+        return outcome
+    }
+
     // MARK: - Duplicates
 
     var showsDuplicates: Bool { !duplicateSets.isEmpty }
@@ -880,7 +1001,13 @@ final class SearchModel {
 
     // MARK: - Full Disk Access
 
+    /// Only the first window checks: without the gate, every window opened with ⌘N would raise
+    /// the explanation sheet again until access was granted.
+    private static var checkedAccessThisLaunch = false
+
     func checkFullDiskAccessAtLaunch() {
+        guard !Self.checkedAccessThisLaunch else { return }
+        Self.checkedAccessThisLaunch = true
         showsFullDiskAccessPrompt = !Self.hasFullDiskAccess()
     }
 
@@ -928,10 +1055,20 @@ final class SearchModel {
     // MARK: - Persistence
 
     private func save<Value: Encodable>(_ value: Value, _ key: String) {
-        defaults.set(try? JSONEncoder().encode(value), forKey: key)
+        defaults.saveJSON(value, key)
     }
 
     private static func load<Value: Decodable>(_ type: Value.Type, _ key: String, _ defaults: UserDefaults) -> Value? {
-        defaults.data(forKey: key).flatMap { try? JSONDecoder().decode(type, from: $0) }
+        defaults.loadJSON(type, key)
+    }
+}
+
+extension UserDefaults {
+    fileprivate func saveJSON<Value: Encodable>(_ value: Value, _ key: String) {
+        set(try? JSONEncoder().encode(value), forKey: key)
+    }
+
+    fileprivate func loadJSON<Value: Decodable>(_ type: Value.Type, _ key: String) -> Value? {
+        data(forKey: key).flatMap { try? JSONDecoder().decode(type, from: $0) }
     }
 }

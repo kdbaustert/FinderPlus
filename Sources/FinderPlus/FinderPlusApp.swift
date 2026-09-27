@@ -3,42 +3,77 @@ import SwiftUI
 @main
 struct FinderPlusApp: App {
     @NSApplicationDelegateAdaptor private var appDelegate: AppDelegate
-    @State private var model = SearchModel()
 
     var body: some Scene {
-        Window("FinderPlus", id: "main") {
-            ContentView()
-                .environment(model)
-                .onAppear { appDelegate.model = model }
-                .frame(minWidth: 860, minHeight: 500)
+        // A window per search — ⌘N opens another, and macOS's automatic window tabbing merges
+        // them into tabs — each with its own query, options and results.
+        WindowGroup("FinderPlus", id: "search") {
+            SearchWindow(appDelegate: appDelegate)
         }
         .defaultSize(width: 1100, height: 700)
         .windowToolbarStyle(.unified)
         // The gaps between the glass panels drag the window, as well as the toolbar.
         .windowBackgroundDragBehavior(.enabled)
-        .commands { SearchCommands(model: model) }
+        .commands { SearchCommands() }
 
         Settings {
             SettingsView()
-                .environment(model)
+                .environment(Preferences.shared)
         }
+    }
+}
+
+/// One search window. Windows search independently — each holds its own model — while the state
+/// behind them is shared through `Preferences.shared`. Whichever window is active registers
+/// itself with the delegate, so folders arriving from Finder's service, the Dock or a Shortcuts
+/// action land in the window the user is looking at.
+private struct SearchWindow: View {
+    let appDelegate: AppDelegate
+    @State private var model = SearchModel(preferences: .shared)
+    @Environment(\.appearsActive) private var appearsActive
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        ContentView()
+            .environment(model)
+            // What routes the menu bar to this window — see SearchCommands.
+            .focusedSceneValue(model)
+            .frame(minWidth: 860, minHeight: 500)
+            .onAppear {
+                appDelegate.model = model
+                appDelegate.openSearchWindow = { openWindow(id: "search") }
+            }
+            .onChange(of: appearsActive) {
+                if appearsActive { appDelegate.model = model }
+            }
+            .onDisappear {
+                if appDelegate.model === model { appDelegate.model = nil }
+            }
     }
 }
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    /// Set once the window exists. Folders that arrive before then wait in `pendingFolders`.
+    /// The model of the active window. Folders and searches that arrive before a window exists
+    /// wait in the `pending` fields below.
     var model: SearchModel? {
-        didSet { searchPendingFolders() }
+        didSet { deliverPending() }
     }
 
+    /// Set by the first window; called to open another when a search arrives after every search
+    /// window was closed but Settings kept the app alive.
+    var openSearchWindow: (() -> Void)?
+
     private var pendingFolders: [URL] = []
+    private var pendingQuery: String?
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.servicesProvider = self
         NSUpdateDynamicServices()
+        // Keeps the Siri phrases for the Shortcuts actions current.
+        FinderPlusShortcuts.updateAppShortcutParameters()
         // Starts Sparkle's daily check. Skipped in development builds, which have no feed.
         if Updater.isConfigured { _ = Updater.shared }
     }
@@ -57,21 +92,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         search(in: urls ?? [])
     }
 
-    private func search(in urls: [URL]) {
-        pendingFolders += urls
-        searchPendingFolders()
+    /// The "Search in FinderPlus" Shortcuts action: fill the query in, then run the search.
+    func searchFromIntent(query: String, folder: URL?) {
+        pendingQuery = query
+        if let folder { pendingFolders.append(folder) }
+        deliver()
     }
 
-    private func searchPendingFolders() {
-        guard let model, !pendingFolders.isEmpty else { return }
-        model.useFolders(pendingFolders)
-        pendingFolders = []
+    private func search(in urls: [URL]) {
+        pendingFolders += urls
+        deliver()
+    }
+
+    private func deliver() {
+        if model == nil { openSearchWindow?() }
+        deliverPending()
+    }
+
+    private func deliverPending() {
+        guard let model, !pendingFolders.isEmpty || pendingQuery != nil else { return }
+        if !pendingFolders.isEmpty {
+            model.useFolders(pendingFolders)
+            pendingFolders = []
+        }
+        if let query = pendingQuery {
+            pendingQuery = nil
+            model.query = query
+            model.start()
+        }
         NSApp.activate()
     }
 }
 
+/// The menu bar. `@FocusedValue` hands each command the active window's model, so with several
+/// windows open every command lands on the one in front; with none, the items that need a window
+/// step aside.
 struct SearchCommands: Commands {
-    let model: SearchModel
+    @FocusedValue(SearchModel.self) private var model
 
     var body: some Commands {
         CommandGroup(replacing: .appInfo) {
@@ -80,65 +137,73 @@ struct SearchCommands: Commands {
                 .disabled(!Updater.isConfigured || !Updater.shared.canCheck)
         }
         CommandGroup(after: .newItem) {
-            Divider()
-            Button("Open") { model.open() }
-                .keyboardShortcut("o")
-                .disabled(model.selection.isEmpty)
-            Button("Show in Finder") { model.reveal() }
-                .keyboardShortcut("r")
-                .disabled(model.selection.isEmpty)
-            Button("Quick Look") { model.toggleQuickLook() }
-                .keyboardShortcut("y")
-                .disabled(model.selection.isEmpty)
-            Button("Copy Path") { model.copyPaths() }
-                .keyboardShortcut("c", modifiers: [.command, .option])
-                .disabled(model.selection.isEmpty)
-            Button("Copy Rows") { model.copyRows() }
-                .disabled(model.selection.isEmpty)
-            Divider()
-            Button("Copy To…") { Task { await model.transfer(nil, .copy) } }
-                .disabled(model.selection.isEmpty)
-            Button("Move To…") { Task { await model.transfer(nil, .move) } }
-                .disabled(model.selection.isEmpty)
-            Divider()
-            Button("Export Results…") { model.exportResults() }
-                .keyboardShortcut("e", modifiers: [.command, .shift])
-                .disabled(model.results.isEmpty)
-            Divider()
-            Button("Move to Trash") { Task { await model.trash() } }
-                .keyboardShortcut(.delete)
-                // ⌘⌫ in the search field deletes to the start of the line; menu shortcuts are
-                // matched first, so without this it would trash the selected results instead.
-                .disabled(model.selection.isEmpty || model.isEditingQuery)
+            if let model {
+                Divider()
+                Button("Open") { model.open() }
+                    .keyboardShortcut("o")
+                    .disabled(model.selection.isEmpty)
+                Button("Show in Finder") { model.reveal() }
+                    .keyboardShortcut("r")
+                    .disabled(model.selection.isEmpty)
+                Button("Quick Look") { model.toggleQuickLook() }
+                    .keyboardShortcut("y")
+                    .disabled(model.selection.isEmpty)
+                Button("Copy Path") { model.copyPaths() }
+                    .keyboardShortcut("c", modifiers: [.command, .option])
+                    .disabled(model.selection.isEmpty)
+                Button("Copy Rows") { model.copyRows() }
+                    .disabled(model.selection.isEmpty)
+                Divider()
+                Button("Copy To…") { Task { await model.transfer(nil, .copy) } }
+                    .disabled(model.selection.isEmpty)
+                Button("Move To…") { Task { await model.transfer(nil, .move) } }
+                    .disabled(model.selection.isEmpty)
+                Button("Rename…") { model.requestRename() }
+                    .disabled(model.selection.isEmpty)
+                Divider()
+                Button("Export Results…") { model.exportResults() }
+                    .keyboardShortcut("e", modifiers: [.command, .shift])
+                    .disabled(model.results.isEmpty)
+                Divider()
+                Button("Move to Trash") { Task { await model.trash() } }
+                    .keyboardShortcut(.delete)
+                    // ⌘⌫ in the search field deletes to the start of the line; menu shortcuts are
+                    // matched first, so without this it would trash the selected results instead.
+                    .disabled(model.selection.isEmpty || model.isEditingQuery)
+            }
         }
         CommandGroup(replacing: .sidebar) {
-            Button(model.showsSidebar ? "Hide Search Options" : "Show Search Options") { model.showsSidebar.toggle() }
-                .keyboardShortcut("s", modifiers: [.control, .command])
-            Button(model.showsPreview ? "Hide Preview" : "Show Preview") { model.showsPreview.toggle() }
-                .keyboardShortcut("p", modifiers: [.command, .option])
+            if let model {
+                Button(model.showsSidebar ? "Hide Search Options" : "Show Search Options") { model.showsSidebar.toggle() }
+                    .keyboardShortcut("s", modifiers: [.control, .command])
+                Button(model.showsPreview ? "Hide Preview" : "Show Preview") { model.showsPreview.toggle() }
+                    .keyboardShortcut("p", modifiers: [.command, .option])
+            }
         }
         CommandMenu("Search") {
-            Button("Find…") { model.focusRequest += 1 }
-                .keyboardShortcut("f")
-            Button("Choose Location…") { model.choosingFolder = true }
-                .keyboardShortcut("l")
-            Button("Start Search") { model.start() }
-                .keyboardShortcut(.return)
-            Button("Stop Search") { model.stop() }
-                .keyboardShortcut(".")
-                .disabled(!model.isSearching)
-            Divider()
-            Button("Find Duplicates in Results") { model.findDuplicates() }
-                .keyboardShortcut("d", modifiers: [.command, .shift])
-                .disabled(model.results.isEmpty || model.isSearching || model.isFindingDuplicates)
-            Button("Show All Results") { model.leaveDuplicates() }
-                .disabled(!model.showsDuplicates)
-            Divider()
-            Picker("Search For", selection: Bindable(model).options.kind) {
-                ForEach(SearchKind.allCases) { Text($0.title).tag($0) }
-            }
-            Picker("Operator", selection: Bindable(model).options.mode) {
-                ForEach(MatchMode.allCases) { Text($0.title).tag($0) }
+            if let model {
+                Button("Find…") { model.focusRequest += 1 }
+                    .keyboardShortcut("f")
+                Button("Choose Location…") { model.choosingFolder = true }
+                    .keyboardShortcut("l")
+                Button("Start Search") { model.start() }
+                    .keyboardShortcut(.return)
+                Button("Stop Search") { model.stop() }
+                    .keyboardShortcut(".")
+                    .disabled(!model.isSearching)
+                Divider()
+                Button("Find Duplicates in Results") { model.findDuplicates() }
+                    .keyboardShortcut("d", modifiers: [.command, .shift])
+                    .disabled(model.results.isEmpty || model.isSearching || model.isFindingDuplicates)
+                Button("Show All Results") { model.leaveDuplicates() }
+                    .disabled(!model.showsDuplicates)
+                Divider()
+                Picker("Search For", selection: Bindable(model).options.kind) {
+                    ForEach(SearchKind.allCases) { Text($0.title).tag($0) }
+                }
+                Picker("Operator", selection: Bindable(model).options.mode) {
+                    ForEach(MatchMode.allCases) { Text($0.title).tag($0) }
+                }
             }
         }
     }

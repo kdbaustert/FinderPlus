@@ -811,3 +811,151 @@ final class ResultActionTests: XCTestCase {
         XCTAssertEqual(found, ["cat", "cat", "Cat"])
     }
 }
+
+final class BatchRenameTests: XCTestCase {
+    /// A local-calendar noon, so the date the recipe stamps cannot straddle midnight in any zone.
+    private let noon = Calendar.current.date(from: DateComponents(year: 2026, month: 9, day: 27, hour: 12))!
+
+    func testReplaceTextWorksOnTheWholeName() {
+        var recipe = BatchRename.Recipe()
+        recipe.action = .replaceText
+        recipe.find = "IMG_"
+        recipe.replacement = "Holiday "
+        XCTAssertEqual(recipe.newName(for: "IMG_0042.jpg", at: 0), "Holiday 0042.jpg")
+        recipe.find = ".jpg"
+        recipe.replacement = ".jpeg"
+        XCTAssertEqual(recipe.newName(for: "IMG_0042.jpg", at: 0), "IMG_0042.jpeg")
+        recipe.find = ""
+        XCTAssertEqual(recipe.newName(for: "IMG_0042.jpg", at: 0), "IMG_0042.jpg")
+    }
+
+    func testSequenceNumbersFromTheStartAndKeepsExtensions() {
+        var recipe = BatchRename.Recipe()
+        recipe.action = .sequence
+        recipe.base = "Holiday"
+        recipe.start = 10
+        XCTAssertEqual(recipe.newName(for: "IMG_0042.jpg", at: 0), "Holiday 10.jpg")
+        XCTAssertEqual(recipe.newName(for: "IMG_0043.HEIC", at: 1), "Holiday 11.HEIC")
+        recipe.base = "  "
+        XCTAssertEqual(recipe.newName(for: "IMG_0042.jpg", at: 0), "IMG_0042 10.jpg")
+    }
+
+    func testChangeCaseKeepsTheExtension() {
+        var recipe = BatchRename.Recipe()
+        recipe.action = .changeCase
+        recipe.caseStyle = .uppercase
+        XCTAssertEqual(recipe.newName(for: "report draft.txt", at: 0), "REPORT DRAFT.txt")
+        recipe.caseStyle = .capitalized
+        XCTAssertEqual(recipe.newName(for: "report draft.txt", at: 0), "Report Draft.txt")
+        recipe.caseStyle = .lowercase
+        XCTAssertEqual(recipe.newName(for: "README", at: 0), "readme")
+    }
+
+    func testAddDateUsesTheLocalDay() {
+        var recipe = BatchRename.Recipe()
+        recipe.action = .addDate
+        recipe.datePosition = .before
+        XCTAssertEqual(recipe.newName(for: "report.txt", at: 0, on: noon), "2026-09-27 report.txt")
+        recipe.datePosition = .after
+        XCTAssertEqual(recipe.newName(for: "report.txt", at: 0, on: noon), "report 2026-09-27.txt")
+    }
+
+    func testProblemsCatchUnusableNames() {
+        XCTAssertNotNil(BatchRename.problem(with: ""))
+        XCTAssertNotNil(BatchRename.problem(with: "a/b"))
+        XCTAssertNotNil(BatchRename.problem(with: "a:b"))
+        XCTAssertNotNil(BatchRename.problem(with: ".."))
+        XCTAssertNotNil(BatchRename.problem(with: String(repeating: "é", count: 200)))
+        XCTAssertNil(BatchRename.problem(with: "Report 2.pdf"))
+    }
+
+    func testPerformRenameSwapsNamesWithoutColliding() throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "FinderPlusRename-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let one = folder.appending(path: "1.txt")
+        let two = folder.appending(path: "2.txt")
+        try "first".write(to: one, atomically: true, encoding: .utf8)
+        try "second".write(to: two, atomically: true, encoding: .utf8)
+
+        let outcome = SearchModel.performRename([
+            RenameStep(source: one, target: two),
+            RenameStep(source: two, target: one),
+        ])
+        XCTAssertEqual(outcome.failed, [])
+        XCTAssertEqual(try String(contentsOf: one, encoding: .utf8), "second")
+        XCTAssertEqual(try String(contentsOf: two, encoding: .utf8), "first")
+        // Nothing left parked under a holding name.
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: folder.path)
+            .filter { $0.hasPrefix(".FinderPlus-rename-") }
+        XCTAssertEqual(leftovers, [])
+    }
+}
+
+@MainActor
+final class PreferencesTests: XCTestCase {
+    private var defaults: UserDefaults!
+
+    override func setUp() async throws {
+        defaults = UserDefaults(suiteName: "FinderPlusPreferences-\(UUID().uuidString)")
+    }
+
+    func testWindowsShareSettingsAndRecents() {
+        let shared = Preferences(defaults: defaults)
+        let first = SearchModel(defaults: defaults, preferences: shared)
+        let second = SearchModel(defaults: defaults, preferences: shared)
+
+        first.settings.showFullPaths = true
+        XCTAssertTrue(second.settings.showFullPaths)
+
+        shared.remember("invoice")
+        XCTAssertEqual(second.recentQueries, ["invoice"])
+        second.clearRecents()
+        XCTAssertEqual(first.recentQueries, [])
+
+        first.customLocations = [.folder("/tmp")]
+        XCTAssertEqual(second.customLocations, [.folder("/tmp")])
+    }
+
+    func testPreferencesPersistAcrossLaunches() {
+        let before = Preferences(defaults: defaults)
+        before.settings.confirmTrash = false
+        before.remember("report")
+        let after = Preferences(defaults: defaults)
+        XCTAssertFalse(after.settings.confirmTrash)
+        XCTAssertEqual(after.recentQueries, ["report"])
+    }
+}
+
+final class IntentSearchTests: XCTestCase {
+    func testFindsByNameAndRespectsTheLimit() async throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "FinderPlusIntent-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        for name in ["a.pdf", "b.pdf", "c.txt"] {
+            try "x".write(to: folder.appending(path: name), atomically: true, encoding: .utf8)
+        }
+
+        var options = SearchOptions()
+        options.mode = .wildcards
+        let all = try await IntentSearch.hits(query: "*.pdf", root: folder, options: options, limit: 0)
+        XCTAssertEqual(Set(all.map(\.name)), ["a.pdf", "b.pdf"])
+
+        let capped = try await IntentSearch.hits(query: "*.pdf", root: folder, options: options, limit: 1)
+        XCTAssertEqual(capped.count, 1)
+
+        await XCTAssertThrowsErrorAsync(
+            try await IntentSearch.hits(
+                query: "*", root: folder.appending(path: "missing"), options: options, limit: 0))
+    }
+}
+
+/// XCTAssertThrowsError has no async form.
+func XCTAssertThrowsErrorAsync<T>(
+    _ expression: @autoclosure () async throws -> T, file: StaticString = #filePath, line: UInt = #line
+) async {
+    do {
+        _ = try await expression()
+        XCTFail("Expected an error", file: file, line: line)
+    } catch {}
+}

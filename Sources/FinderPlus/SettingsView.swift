@@ -21,26 +21,26 @@ struct SettingsView: View {
 }
 
 private struct GeneralSettings: View {
-    @Environment(SearchModel.self) private var model
+    @Environment(Preferences.self) private var preferences
     /// Re-read on appearing and whenever the app comes back to the front, so it reflects a change
     /// just made in System Settings.
     @State private var hasFullDiskAccess = SearchModel.hasFullDiskAccess()
 
     var body: some View {
-        @Bindable var model = model
+        @Bindable var preferences = preferences
         Form {
             Section("Results") {
-                Picker("Double-clicking a result", selection: $model.settings.doubleClick) {
+                Picker("Double-clicking a result", selection: $preferences.settings.doubleClick) {
                     ForEach(AppSettings.DoubleClick.allCases) { Text($0.title).tag($0) }
                 }
-                Toggle("Show full paths in the Location column", isOn: $model.settings.showFullPaths)
-                Toggle("Ask before moving items to the Trash", isOn: $model.settings.confirmTrash)
+                Toggle("Show full paths in the Location column", isOn: $preferences.settings.showFullPaths)
+                Toggle("Ask before moving items to the Trash", isOn: $preferences.settings.confirmTrash)
             }
             Section {
-                Toggle("Remember recent searches", isOn: $model.settings.rememberRecents)
+                Toggle("Remember recent searches", isOn: $preferences.settings.rememberRecents)
                 LabeledContent("Saved searches") {
-                    Button("Clear Recent Searches") { model.clearRecents() }
-                        .disabled(model.recentQueries.isEmpty)
+                    Button("Clear Recent Searches") { preferences.clearRecents() }
+                        .disabled(preferences.recentQueries.isEmpty)
                 }
             } header: {
                 Text("History")
@@ -76,17 +76,17 @@ private struct GeneralSettings: View {
 }
 
 private struct SearchSettings: View {
-    @Environment(SearchModel.self) private var model
+    @Environment(Preferences.self) private var preferences
     @State private var newFolderName = ""
 
     private static let sizes = [10, 25, 50, 100, 250, 500]
     private static let limits = [0, 1_000, 10_000, 100_000]
 
     var body: some View {
-        @Bindable var model = model
+        @Bindable var preferences = preferences
         Form {
             Section {
-                Picker("Largest file to read", selection: $model.settings.maxContentMegabytes) {
+                Picker("Largest file to read", selection: $preferences.settings.maxContentMegabytes) {
                     ForEach(Self.sizes, id: \.self) { Text("\($0) MB").tag($0) }
                 }
             } header: {
@@ -96,7 +96,7 @@ private struct SearchSettings: View {
             }
 
             Section {
-                Picker("Stop after", selection: $model.settings.maxResults) {
+                Picker("Stop after", selection: $preferences.settings.maxResults) {
                     ForEach(Self.limits, id: \.self) { limit in
                         Text(limit == 0 ? "No limit" : "\(limit.formatted()) matches").tag(limit)
                     }
@@ -108,12 +108,12 @@ private struct SearchSettings: View {
             }
 
             Section {
-                ForEach(model.settings.skippedFolderNames, id: \.self) { name in
+                ForEach(preferences.settings.skippedFolderNames, id: \.self) { name in
                     HStack {
                         Label(name, systemImage: "folder")
                         Spacer()
                         Button {
-                            model.settings.skippedFolderNames.removeAll { $0 == name }
+                            preferences.settings.skippedFolderNames.removeAll { $0 == name }
                         } label: {
                             Image(systemName: "minus.circle.fill").foregroundStyle(.secondary)
                         }
@@ -127,9 +127,9 @@ private struct SearchSettings: View {
                     Button("Add", action: addFolderName)
                         .disabled(trimmedName.isEmpty)
                 }
-                if model.settings.skippedFolderNames.isEmpty {
+                if preferences.settings.skippedFolderNames.isEmpty {
                     Button("Add Common Developer Folders") {
-                        model.settings.skippedFolderNames = ["node_modules", ".git", "DerivedData", ".build"]
+                        preferences.settings.skippedFolderNames = ["node_modules", ".git", "DerivedData", ".build"]
                     }
                 }
             } header: {
@@ -148,8 +148,8 @@ private struct SearchSettings: View {
     private func addFolderName() {
         let name = trimmedName
         guard !name.isEmpty else { return }
-        let known = model.settings.skippedFolderNames.contains { $0.caseInsensitiveCompare(name) == .orderedSame }
-        if !known { model.settings.skippedFolderNames.append(name) }
+        let known = preferences.settings.skippedFolderNames.contains { $0.caseInsensitiveCompare(name) == .orderedSame }
+        if !known { preferences.settings.skippedFolderNames.append(name) }
         newFolderName = ""
     }
 }

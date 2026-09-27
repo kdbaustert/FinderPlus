@@ -15,6 +15,31 @@ echo "==> Compiling"
 swift build -c release
 BIN="$(swift build -c release --show-bin-path)/FinderPlus"
 
+# The Shortcuts/Siri actions in Intents.swift only exist to the system through a
+# Metadata.appintents bundle, which Xcode builds produce and `swift build` does not. The metadata
+# processor (run after assembly, below) reads `.swiftconstvalues` files the compiler emits when
+# asked, for the protocols named in a JSON list.
+#
+# A *separate* build in its own scratch path, always carrying the emission flags, rather than the
+# flags on the main build above: llbuild does not fingerprint `-Xswiftc` flags, so adding them to
+# an up-to-date tree rebuilds nothing and emits nothing. Absolute paths throughout — the emission
+# path resolves against the compiler's working directory, and a relative one lands nowhere.
+# (The same arrangement as Cmd-Tab's, where the pitfalls above were measured.)
+INTENTS_DIR="$(pwd)/.build/appintents"
+mkdir -p "$INTENTS_DIR"
+CONSTVALS="$INTENTS_DIR/FinderPlus.swiftconstvalues"
+printf '%s' '["AppIntent","AppEntity","AppEnum","AppShortcutsProvider","TransientAppEntity","EntityQuery","DynamicOptionsProvider","EnumerableEntityQuery","AppIntentsPackage"]' \
+    > "$INTENTS_DIR/protocols.json"
+echo "==> Extracting App Intents const values"
+swift build -c release --scratch-path "$INTENTS_DIR/scratch" \
+    -Xswiftc -emit-const-values-path -Xswiftc "$CONSTVALS" \
+    -Xswiftc -Xfrontend -Xswiftc -const-gather-protocols-file \
+    -Xswiftc -Xfrontend -Xswiftc "$INTENTS_DIR/protocols.json" >/dev/null
+if [[ ! -s "$CONSTVALS" ]]; then
+    echo "==> ERROR: $CONSTVALS was not emitted — the Shortcuts actions would be invisible" >&2
+    exit 1
+fi
+
 echo "==> Assembling bundle"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -32,6 +57,33 @@ xcrun actool Resources/Assets.xcassets \
     --output-partial-info-plist "$(mktemp -d)/partial.plist" >/dev/null
 if [[ ! -f "$APP/Contents/Resources/Assets.car" ]]; then
     echo "==> ERROR: actool did not produce Assets.car" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------- App Intents metadata
+#
+# Turns the const values emitted above into Contents/Resources/Metadata.appintents — where every
+# Xcode-built macOS app carries it, and what Shortcuts, Spotlight and Siri actually index. Before
+# signing, because the app's seal covers it. The processor wants the *source* list as well as the
+# const values, and a deployment target and triple that match the build.
+echo "==> App Intents metadata"
+find "$(pwd)/Sources/FinderPlus" -name '*.swift' > "$INTENTS_DIR/sources.txt"
+echo "$CONSTVALS" > "$INTENTS_DIR/constvals.txt"
+INTENTS_TOOL="$(xcrun --find appintentsmetadataprocessor)"
+xcrun appintentsmetadataprocessor \
+    --output "$APP/Contents/Resources" \
+    --toolchain-dir "${INTENTS_TOOL%/usr/bin/appintentsmetadataprocessor}" \
+    --module-name FinderPlus \
+    --sdk-root "$(xcrun --show-sdk-path --sdk macosx)" \
+    --xcode-version "$(xcodebuild -version | tail -1 | awk '{print $3}')" \
+    --platform-family macOS \
+    --deployment-target 26.0 \
+    --target-triple "$(uname -m)-apple-macos26.0" \
+    --source-file-list "$INTENTS_DIR/sources.txt" \
+    --swift-const-vals-list "$INTENTS_DIR/constvals.txt" \
+    --force --quiet-warnings >/dev/null
+if [[ ! -f "$APP/Contents/Resources/Metadata.appintents/extract.actionsdata" ]]; then
+    echo "==> ERROR: Metadata.appintents did not materialise — the Shortcuts actions would be invisible" >&2
     exit 1
 fi
 

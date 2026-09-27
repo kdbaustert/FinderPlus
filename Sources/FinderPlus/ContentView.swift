@@ -54,6 +54,9 @@ struct ContentView: View {
         .sheet(isPresented: Bindable(model).showsFullDiskAccessPrompt) {
             FullDiskAccessSheet()
         }
+        .sheet(item: Bindable(model).renameRequest) { request in
+            RenameSheet(hits: request.hits)
+        }
         .task { model.checkFullDiskAccessAtLaunch() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             model.recheckFullDiskAccess()
@@ -720,6 +723,7 @@ struct ResultMenu: View {
             Divider()
             Button("Copy To…") { Task { await model.transfer(ids, .copy) } }
             Button("Move To…") { Task { await model.transfer(ids, .move) } }
+            Button("Rename…") { model.requestRename(ids) }
             Divider()
             Button("Move to Trash", role: .destructive) { Task { await model.trash(ids) } }
         }

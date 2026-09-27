@@ -71,6 +71,8 @@ files, and anything that was never indexed. Runs on macOS 26 and later.
 - Open, **Open With**, Show in Finder, Quick Look, Copy Path, Share and Move to Trash — from the
   toolbar, the context menu or the keyboard. Drag results into other apps.
 - **Copy To** and **Move To** another folder, without overwriting anything already there.
+- **Rename** the selected results in one go — find and replace, name-and-number, change case, or
+  add the date — with every new name shown, and checked for collisions, before anything is touched.
 - **Export** the results as a spreadsheet (CSV), or copy the selected rows as a table.
 - **Find duplicates** among the results: files with identical contents, grouped into sets, with the
   space the extra copies take.
@@ -81,6 +83,8 @@ files, and anything that was never indexed. Runs on macOS 26 and later.
 ### Interface
 
 - Liquid Glass: a glass toolbar, search field and controls over one even, translucent window.
+- **Several searches at once:** ⌘N opens another window, each with its own query, options and
+  results; merge them into tabs from the Window menu if you prefer.
 - Searches start only when you press **Find** — nothing runs while you type or change options.
 - A new search in the same place narrows the results already on screen instead of blanking them.
 - **Settings:** what double-clicking a result does, asking before moving to the Trash, recent
@@ -88,6 +92,14 @@ files, and anything that was never indexed. Runs on macOS 26 and later.
   whether Full Disk Access is granted.
 - **About FinderPlus** (in the app menu, and as a tab in Settings): the version, who made it, and a
   link to the project on GitHub.
+
+### Shortcuts and Siri
+
+- **Find Files** and **Find Duplicate Files** actions for the Shortcuts app: search a folder — or
+  return a folder's extra copies, keeping the oldest of each set — and hand the files straight to
+  the next action, no window needed.
+- **Search in FinderPlus** opens the app with the search already running; "Search with FinderPlus"
+  also works as a Siri phrase.
 
 ### Updates
 
