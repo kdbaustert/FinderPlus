@@ -3,8 +3,8 @@ import Observation
 import Sparkle
 
 /// Updates from GitHub Releases, through Sparkle: it downloads the new version, checks its EdDSA
-/// signature against `SUPublicEDKey`, and replaces the app. The feed and every archive are assets
-/// of the releases themselves — see `SUFeedURL` in Info.plist and release.sh.
+/// signature against `SUPublicEDKey`, and replaces the app. Each archive is an asset of its release;
+/// the feed is served by GitHub Pages — see `SUFeedURL` in Info.plist and release.sh.
 ///
 /// Wrapped rather than used bare because two of Sparkle's facts are needed as observable state:
 /// whether a check can start now (not while one is running) and when the last one finished. Both

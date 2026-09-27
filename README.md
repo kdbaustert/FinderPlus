@@ -142,20 +142,35 @@ duplicate checks skip iCloud files that aren't downloaded, so they never downloa
 swift test            # the test suite
 ```
 
-To publish a release, commit and push, then:
+To publish a release, push a version tag. GitHub Actions builds, signs and publishes it, adds it to
+the update feed, and records the version in `Resources/Info.plist` on `master`:
 
 ```sh
-VERSION=1.1.0 BUILD=2 ./release.sh --publish                 # a stable release
-VERSION=1.2.0-beta.1 BUILD=3 ./release.sh --beta --publish   # a beta, published as a pre-release
+git tag v1.2.0 && git push origin v1.2.0            # a stable release
+git tag v1.3.0-beta && git push origin v1.3.0-beta  # a beta, offered only to copies that opt in
 ```
 
-`BUILD` must grow with every release, betas and stable alike. Without `--publish` the script
-builds and prepares everything but uploads nothing. The update feed lives on a release named
-`appcast`, which the script creates on the first publish and updates on every one after. Releases are signed without an Apple Developer ID, so the first download needs
-right-click → **Open**; updates after that install normally.
+The update feed is served by GitHub Pages from the `gh-pages` branch. To check a release before
+tagging it, `VERSION=1.2.0 BUILD=40 ./release.sh [--beta]` builds the zip and the feed locally
+without publishing anything. Releases are signed without an Apple Developer ID, so the first
+download needs right-click → **Open**; updates after that install normally.
 
 Building needs Xcode. To change the app icon, edit `Resources/Icon/make-icon.swift` and run
 `swift Resources/Icon/make-icon.swift` from the repository root before building.
+
+## Contributing
+
+Issues and pull requests are welcome — for a bug, say what you searched for, where, and with which
+options, since those decide what FinderPlus reads.
+
+```sh
+./build.sh --install  # builds build/FinderPlus.app, copies it to /Applications and launches it
+swift test            # the test suite; CI runs it, and builds the app, on every push and pull request
+```
+
+Building needs Xcode and macOS 26. Keep to the style of the file you're changing, and add a test
+for behaviour you add or fix — most of the search engine can be tested without a window. Releases
+are made by maintainers, by pushing a version tag.
 
 ## License
 

@@ -1,9 +1,9 @@
 name: Release
 
-# Pushing a tag publishes that version. `v1.2.0` is a stable release, reaching everyone; a tag with a
-# hyphen, like `v1.3.0-beta.1`, is a beta — a GitHub pre-release on Sparkle's beta channel, offered
-# only to copies with "Receive beta updates" on. Both run release.sh, the same script as a release
-# made from a Mac, so there is one way to release rather than two that drift apart.
+# Tag-driven, the same way as Cmd-Tab. Pushing `v1.2.0` builds, signs and publishes that version and
+# adds it to the update feed every installed copy checks within a day. A tag with a hyphen, like
+# `v1.3.0-beta`, is a beta: the same kind of release, but its feed entry is on Sparkle's beta
+# channel, so only copies with "Receive beta updates" on are offered it.
 on:
   push:
     tags: ['v*']
@@ -14,7 +14,7 @@ on:
         description: 'Existing tag to release (e.g. v1.2.0)'
         required: true
 
-# Two releases at once would race on the update feed, and one would lose its entry.
+# Two releases at once would race on the feed, and one would lose its entry.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -24,7 +24,7 @@ permissions:
 
 jobs:
   release:
-    name: Build and publish
+    name: Build, sign and publish
     # The OS the app requires, since it uses macOS 26 APIs throughout.
     runs-on: macos-26
     timeout-minutes: 45
@@ -33,7 +33,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
-          # The build number is the commit count, which needs the whole history.
+          # The build number is the commit count, which needs the whole history; the feed step
+          # also fetches and pushes gh-pages.
           fetch-depth: 0
 
       - name: Version from the tag
@@ -47,6 +48,7 @@ jobs:
           BUILD="$(git rev-list --count HEAD)"
           BETA=0
           [[ "$VERSION" == *-* ]] && BETA=1
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "build=$BUILD" >> "$GITHUB_OUTPUT"
           echo "beta=$BETA" >> "$GITHUB_OUTPUT"
@@ -59,11 +61,9 @@ jobs:
 
       # The key that signs each update. Its public half is SUPublicEDKey in Info.plist; if the two
       # ever differ, every installed copy silently refuses every update — so that is checked here,
-      # before anything is built or published.
-      #
-      # Signing itself reads the key from a file (SPARKLE_KEY_FILE below), not the keychain: read
-      # from the runner's keychain, generate_appcast stops for a permission prompt that no one is
-      # there to answer, and the job hangs until it times out (seen on the first beta).
+      # before anything is built. Signing reads the key from a file, not the keychain: read from a
+      # runner's keychain, generate_appcast stops for a permission prompt nobody is there to answer
+      # and the job hangs until it times out.
       - name: Import the Sparkle signing key
         env:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
@@ -85,23 +85,119 @@ jobs:
             echo "  secret:     $ACTUAL"
             exit 1
           fi
+          echo "Sparkle key matches Info.plist."
 
+      # The same suite CI runs, run again here: a tag is its own trigger, so nothing ties it to a
+      # green run on the commit it points at.
       - name: Test
         run: swift test
 
-      - name: Build and publish
+      # The same script a release checked by hand runs. It reads the feed so far from gh-pages and
+      # writes the extended one to build/releases/appcast.xml.
+      - name: Build and sign
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPARKLE_KEY_FILE: ${{ runner.temp }}/sparkle_key
           VERSION: ${{ steps.version.outputs.version }}
           BUILD: ${{ steps.version.outputs.build }}
         run: |
-          set -euo pipefail
           if [[ "${{ steps.version.outputs.beta }}" == "1" ]]; then
-            ./release.sh --beta --publish
+            ./release.sh --beta
           else
-            ./release.sh --publish
+            ./release.sh
           fi
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          ASSET="build/releases/FinderPlus-$VERSION.zip"
+          [[ -f "$ASSET" ]] || { echo "::error::missing $ASSET"; exit 1; }
+          NOTES=$'This build is ad-hoc signed, not notarised — there is no Apple Developer Program\nmembership behind it yet. macOS Gatekeeper will call the download damaged or from an\nunidentified developer on first launch. To open it: right-click FinderPlus.app → Open, or run\n`xattr -cr /path/to/FinderPlus.app` in Terminal.\n\n'
+          # --generate-notes adds the changes since the last tag after the notice above.
+          gh release create "$TAG" "$ASSET" \
+            --title "FinderPlus $VERSION" \
+            --notes "$NOTES" \
+            --generate-notes
+
+      # Last, and only on success: a feed entry pointing at a release that failed to upload is an
+      # update every client tries and fails to install.
+      - name: Publish the appcast
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # An orphan branch: the feed has no relationship to the source history, and carrying the
+          # whole tree into Pages would publish the repository as a website by accident.
+          WORKTREE="$RUNNER_TEMP/pages"
+          if git ls-remote --exit-code --heads origin gh-pages > /dev/null 2>&1; then
+            git fetch origin gh-pages
+            git worktree add "$WORKTREE" origin/gh-pages
+            git -C "$WORKTREE" checkout -B gh-pages
+          else
+            git worktree add --detach "$WORKTREE"
+            git -C "$WORKTREE" checkout --orphan gh-pages
+            git -C "$WORKTREE" rm -rf . > /dev/null 2>&1 || true
+          fi
+
+          cp build/releases/appcast.xml "$WORKTREE/appcast.xml"
+          # Stops Pages running the file through Jekyll, which mangles XML it takes for a template.
+          touch "$WORKTREE/.nojekyll"
+
+          git -C "$WORKTREE" add appcast.xml .nojekyll
+          if git -C "$WORKTREE" diff --cached --quiet; then
+            echo "Appcast unchanged."
+          else
+            git -C "$WORKTREE" commit -m "Appcast: FinderPlus $VERSION"
+            git -C "$WORKTREE" push origin gh-pages
+          fi
+
+      # release.sh stamped the version into this checkout's Info.plist; this carries it to the
+      # default branch, so a local build reports what was last shipped. Last, so a failed release
+      # never bumps the version. Through the contents API: the commit is signed by GitHub, and the
+      # blob sha makes the write refuse rather than overwrite if the branch changed in between.
+      - name: Record the version on the default branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          BUILD: ${{ steps.version.outputs.build }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          FILE=Resources/Info.plist
+          PLIST="$RUNNER_TEMP/Info.plist"
+          gh api "repos/$REPO/contents/$FILE?ref=$BRANCH" > "$RUNNER_TEMP/current.json"
+          SHA=$(jq -r .sha "$RUNNER_TEMP/current.json")
+          jq -r .content "$RUNNER_TEMP/current.json" | base64 -D > "$PLIST"
+
+          stamp() {
+            KEY="$1" VALUE="$2" perl -0pi -e \
+              's{(<key>\Q$ENV{KEY}\E</key>\s*<string>)[^<]*(</string>)}{$1$ENV{VALUE}$2}' "$PLIST"
+            if [[ "$(/usr/libexec/PlistBuddy -c "Print :$1" "$PLIST")" != "$2" ]]; then
+              echo "::error::could not stamp $1=$2 into $FILE"
+              exit 1
+            fi
+          }
+          cp "$PLIST" "$PLIST.before"
+          stamp CFBundleShortVersionString "$VERSION"
+          stamp CFBundleVersion "$BUILD"
+          if cmp -s "$PLIST" "$PLIST.before"; then
+            echo "$BRANCH already records $VERSION ($BUILD)."
+            exit 0
+          fi
+          COMMIT=$(gh api -X PUT "repos/$REPO/contents/$FILE" \
+            -f message="Record FinderPlus $VERSION ($BUILD) in Info.plist" \
+            -f content="$(base64 -i "$PLIST")" \
+            -f sha="$SHA" \
+            -f branch="$BRANCH" \
+            --jq .commit.sha)
+          echo "Committed $COMMIT to $BRANCH."
 
       # Even when a step above failed: the key file must not outlive the job.
       - name: Remove the signing key file
