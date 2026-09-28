@@ -383,9 +383,10 @@ final class SearchModel {
         selection.formIntersection(knownIDs)
     }
 
-    /// A failed search clears its rows, and the selection with them, so no toolbar action stays
-    /// enabled for rows that are gone.
+    /// A failed search clears its rows, and the selection and duplicates view with them, so no
+    /// toolbar action stays enabled — and no duplicates bar stays up — for rows that are gone.
     private func showFailure(_ message: String) {
+        leaveDuplicates(restoring: false)
         results = []
         selection = []
         phase = .failed(message)
@@ -898,15 +899,9 @@ final class SearchModel {
         defer { Self.batchesInFlight -= 1 }
         let outcome = await Task.detached { Self.perform(kind, sources, into: destination) }.value
         if kind == .move, !outcome.done.isEmpty {
-            results = results.map { hit in
-                guard !hit.isArchiveEntry, let moved = outcome.done[hit.url] else { return hit }
-                return FileHit(
-                    url: moved, name: moved.lastPathComponent, isFolder: hit.isFolder, size: hit.size,
-                    modified: hit.modified, created: hit.created, kind: hit.kind, snippet: hit.snippet)
-            }
-            let remaining = Set(results.map(\.id))
-            selection.formIntersection(remaining)
-            knownIDs = remaining
+            // The same follow-the-file update a rename gets: rows inside a moved folder — and
+            // entries inside a moved archive — follow it rather than pointing at the old paths.
+            relocateRows(after: outcome)
         }
         guard !outcome.failed.isEmpty else { return }
         let refused = sources.filter { outcome.done[$0] == nil }
@@ -976,22 +971,7 @@ final class SearchModel {
         defer { Self.batchesInFlight -= 1 }
         let outcome = await Task.detached { Self.performRename(steps) }.value
         if !outcome.done.isEmpty {
-            let renamed = Dictionary(uniqueKeysWithValues: outcome.done.map { ($0.key.path, $0.value.path) })
-            let before = results
-            results = Self.relocate(results, renamed)
-            let newIDs = Dictionary(zip(before.map(\.id), results.map(\.id))) { first, _ in first }
-            selection = Set(selection.map { newIDs[$0] ?? $0 })
-            knownIDs = Set(results.map(\.id))
-            resultsBeforeDuplicates = resultsBeforeDuplicates.map { Self.relocate($0, renamed) }
-            if showsDuplicates {
-                // Renamed rows keep their set number, and the rows stay grouped the way Find
-                // Duplicates lays them out rather than scattering under the sorted column.
-                let sets = duplicateSets.map { (newIDs[$0.key] ?? $0.key, $0.value) }
-                duplicateSets = Dictionary(sets) { first, _ in first }
-                results.sort { (duplicateSets[$0.id] ?? 0, $0.name) < (duplicateSets[$1.id] ?? 0, $1.name) }
-            } else {
-                resort()
-            }
+            relocateRows(after: outcome)
         }
         guard !outcome.failed.isEmpty else { return }
         // Where each file is now: the batch is undone, bar any file the alert says ended elsewhere.
@@ -1003,6 +983,32 @@ final class SearchModel {
             alert.messageText = "Couldn’t rename \(Self.describe(items))"
             alert.informativeText = outcome.failed.joined(separator: "\n")
             alert.runModal()
+        }
+    }
+
+    /// Rows, selection and the duplicates view after files renamed or moved on disk: every row
+    /// under a changed path follows it, staying selected and keeping its duplicate-set number
+    /// under its new ID.
+    func relocateRows(after outcome: TransferOutcome) {
+        let renamed = Dictionary(uniqueKeysWithValues: outcome.done.map { ($0.key.path, $0.value.path) })
+        let before = results
+        results = Self.relocate(results, renamed)
+        let newIDs = Dictionary(zip(before.map(\.id), results.map(\.id))) { first, _ in first }
+        selection = Set(selection.map { newIDs[$0] ?? $0 })
+        knownIDs = Set(results.map(\.id))
+        resultsBeforeDuplicates = resultsBeforeDuplicates.map { Self.relocate($0, renamed) }
+        if showsDuplicates {
+            // Relocated rows keep their set number, and the rows stay grouped the way Find
+            // Duplicates lays them out rather than scattering under the sorted column. A shown
+            // row wins the collision when its new path is the lingering key of a row trashed
+            // from the view, so its set number never depends on dictionary order.
+            var sets: [FileHit.ID: Int] = [:]
+            for (id, number) in duplicateSets where newIDs[id] == nil { sets[id] = number }
+            for (old, new) in newIDs { if let number = duplicateSets[old] { sets[new] = number } }
+            duplicateSets = sets
+            results.sort { (duplicateSets[$0.id] ?? 0, $0.name) < (duplicateSets[$1.id] ?? 0, $1.name) }
+        } else {
+            resort()
         }
     }
 
@@ -1128,11 +1134,12 @@ final class SearchModel {
 
     /// How many sets, how many files in them, and the space the extra copies take.
     var duplicateSummary: (sets: Int, files: Int, reclaimable: Int64) {
-        let sets = Dictionary(grouping: results.filter { duplicateSets[$0.id] != nil }) { duplicateSets[$0.id]! }
+        let members = results.compactMap { hit in duplicateSets[hit.id].map { (number: $0, hit: hit) } }
+        let sets = Dictionary(grouping: members, by: \.number)
         let reclaimable = sets.values.reduce(Int64(0)) { total, set in
-            total + Int64(set.count - 1) * max(set.first?.size ?? 0, 0)
+            total + Int64(set.count - 1) * max(set.first?.hit.size ?? 0, 0)
         }
-        return (sets.count, sets.values.reduce(0) { $0 + $1.count }, reclaimable)
+        return (sets.count, members.count, reclaimable)
     }
 
     /// Narrows the results to files whose contents match another result's, grouped into sets.

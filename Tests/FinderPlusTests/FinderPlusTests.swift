@@ -888,6 +888,107 @@ final class ResultActionTests: XCTestCase {
         XCTAssertFalse(model.showsDuplicates)
     }
 
+    // Moving a folder used to rewrite only the folder's own row: rows for the files inside it
+    // kept their old paths, resolving to whatever later took those names.
+    func testMovingAFolderCarriesItsChildRowsAlong() async throws {
+        _ = try write("pack/paper.txt", "x")
+        let model = SearchModel(defaults: defaults)
+        model.locationID = root.path
+        model.query = "pa"
+        model.start()
+        try await finish(model)
+        XCTAssertEqual(model.results.map(\.name).sorted(), ["pack", "paper.txt"])
+
+        let folder = try XCTUnwrap(model.results.first { $0.isFolder })
+        model.selection = [folder.id]
+        let destination = root.appending(path: "out")
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let outcome = SearchModel.perform(.move, [folder.url], into: destination)
+        XCTAssertEqual(outcome.failed, [])
+        model.relocateRows(after: outcome)
+
+        let child = try XCTUnwrap(model.results.first { $0.name == "paper.txt" })
+        XCTAssertEqual(child.url.path, destination.appending(path: "pack/paper.txt").path)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: child.url.path))
+        // The moved folder stays selected under its new ID, the way a renamed row does.
+        XCTAssertEqual(model.selection, [destination.appending(path: "pack").path])
+    }
+
+    func testMovingADuplicateKeepsItsSetNumber() async throws {
+        _ = try write("a/photo.jpg", "same bytes")
+        _ = try write("b/photo copy.jpg", "same bytes")
+
+        let model = SearchModel(defaults: defaults)
+        model.locationID = root.path
+        model.query = "jpg"
+        model.start()
+        try await finish(model)
+        model.findDuplicates()
+        try await finish(model)
+        XCTAssertEqual(model.results.count, 2)
+
+        let victim = try XCTUnwrap(model.results.first { $0.name == "photo.jpg" })
+        let destination = root.appending(path: "c")
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let outcome = SearchModel.perform(.move, [victim.url], into: destination)
+        XCTAssertEqual(outcome.failed, [])
+        model.relocateRows(after: outcome)
+
+        let moved = try XCTUnwrap(model.results.first { $0.url.path.hasPrefix(destination.path) })
+        XCTAssertEqual(model.duplicateSets[moved.id], 1)
+        XCTAssertEqual(model.duplicateSummary.files, 2)
+    }
+
+    func testRenamingADuplicateToAFreshNameKeepsItsSetNumber() async throws {
+        _ = try write("a/photo.jpg", "same bytes")
+        _ = try write("b/photo copy.jpg", "same bytes")
+
+        let model = SearchModel(defaults: defaults)
+        model.locationID = root.path
+        model.query = "jpg"
+        model.start()
+        try await finish(model)
+        model.findDuplicates()
+        try await finish(model)
+        XCTAssertEqual(model.results.count, 2)
+
+        let victim = try XCTUnwrap(model.results.first { $0.name == "photo.jpg" })
+        let target = victim.url.deletingLastPathComponent().appending(path: "fresh.jpg")
+        await model.rename([RenameStep(source: victim.url, target: target)])
+
+        let renamed = try XCTUnwrap(model.results.first { $0.name == "fresh.jpg" })
+        XCTAssertEqual(model.duplicateSets[renamed.id], 1)
+        XCTAssertEqual(model.duplicateSummary.sets, 1)
+        XCTAssertEqual(model.duplicateSummary.files, 2)
+    }
+
+    func testAFailedSearchClearsTheDuplicatesView() async throws {
+        _ = try write("a/photo.jpg", "same bytes")
+        _ = try write("b/photo copy.jpg", "same bytes")
+
+        let model = SearchModel(defaults: defaults)
+        model.locationID = root.path
+        model.query = "jpg"
+        model.start()
+        try await finish(model)
+        model.findDuplicates()
+        try await finish(model)
+        XCTAssertTrue(model.showsDuplicates)
+
+        // An unclosed regex group fails in start() before anything is walked.
+        model.options.mode = .regex
+        model.query = "(unclosed"
+        model.start()
+        try await finish(model)
+        guard case .failed = model.phase else {
+            return XCTFail("the search should have failed, not \(model.phase)")
+        }
+        XCTAssertTrue(model.results.isEmpty)
+        XCTAssertFalse(model.showsDuplicates, "a failed search must not leave the duplicates bar up")
+        model.leaveDuplicates()
+        XCTAssertTrue(model.results.isEmpty, "nothing to restore after a failed search")
+    }
+
     func testAFileHandedToTheServiceSearchesItsFolder() throws {
         let file = try write("Projects/plan.txt", "x")
         let model = SearchModel(defaults: defaults)
