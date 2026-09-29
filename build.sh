@@ -31,7 +31,7 @@ BIN="$(swift build -c release ${ARCH_ARGS[@]+"${ARCH_ARGS[@]}"} --show-bin-path)
 # flags on the main build above: llbuild does not fingerprint `-Xswiftc` flags, so adding them to
 # an up-to-date tree rebuilds nothing and emits nothing. Absolute paths throughout — the emission
 # path resolves against the compiler's working directory, and a relative one lands nowhere.
-# (The same arrangement as Cmd-Tab's, where the pitfalls above were measured.)
+# (Both pitfalls above were measured, not guessed.)
 INTENTS_DIR="$(pwd)/.build/appintents"
 mkdir -p "$INTENTS_DIR"
 CONSTVALS="$INTENTS_DIR/FinderPlus.swiftconstvalues"
@@ -138,7 +138,7 @@ fi
 #
 # Ad-hoc by default: the app needs no entitlements. The one cost is that macOS keys folder-access
 # prompts (Desktop, Documents, Downloads) to the code hash, so each rebuild may ask again. A stable
-# local identity, as Cmd-Tab uses, would stop that — set CODESIGN_IDENTITY.
+# local identity would stop that — set CODESIGN_IDENTITY.
 #
 # Inside out, because an outer signature seals the inner ones: first the bare helper executables in
 # Sparkle (Autoupdate), then its bundles deepest first (XPC services, Updater.app, the framework),

@@ -2,7 +2,7 @@
 # Builds a FinderPlus release: the app, its zip, and the update feed with this release added.
 #
 # Releases are published by GitHub Actions when a version tag is pushed — see
-# .github/workflows/release.yml — the same way as Cmd-Tab's. This script is the build half that
+# .github/workflows/release.yml. This script is the build half that
 # workflow runs, and it can be run by hand to check a release before tagging it:
 #
 #   VERSION=1.2.0 BUILD=40 ./release.sh               a stable release

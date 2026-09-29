@@ -11,7 +11,6 @@ let package = Package(
     dependencies: [
         // Updates. Distributed as a binary XCFramework, so build.sh has to copy it into
         // Contents/Frameworks, add an rpath, and sign it before the app — see the comments there.
-        // At least the version Cmd-Tab ships.
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.9.5"),
     ],
     targets: [

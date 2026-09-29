@@ -59,14 +59,14 @@
 			</array>
 		</dict>
 	</array>
-	<!-- Updates, through Sparkle, from a feed served by GitHub Pages off the gh-pages branch — the
-	     same arrangement as Cmd-Tab. The release workflow adds each release's entry to it; the
+	<!-- Updates, through Sparkle, from a feed served by GitHub Pages off the gh-pages branch.
+	     The release workflow adds each release's entry to it; the
 	     releases themselves carry only the zip. build.sh deletes this key from local builds, so a
 	     development copy never updates itself out from under its developer. -->
 	<key>SUFeedURL</key>
 	<string>https://kdbaustert.github.io/FinderPlus/appcast.xml</string>
-	<!-- The public half of the EdDSA key every release is signed with (the same key as Cmd-Tab's;
-	     one key serves every app). Sparkle checks each download against it before unpacking, so
+	<!-- The public half of the EdDSA key every release is signed with (one key serves all of this
+	     developer's apps). Sparkle checks each download against it before unpacking, so
 	     nobody else can ship FinderPlus's users an update. The private half is in the login
 	     keychain, where release.sh's generate_appcast reads it. -->
 	<key>SUPublicEDKey</key>

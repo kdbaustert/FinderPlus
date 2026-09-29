@@ -1,6 +1,6 @@
 name: Release
 
-# Tag-driven, the same way as Cmd-Tab. Pushing `v1.2.0` builds, signs and publishes that version and
+# Tag-driven. Pushing `v1.2.0` builds, signs and publishes that version and
 # adds it to the update feed every installed copy checks within a day. A tag with a hyphen, like
 # `v1.3.0-beta`, is a beta: the same kind of release, but its feed entry is on Sparkle's beta
 # channel, so only copies with "Receive beta updates" on are offered it.
