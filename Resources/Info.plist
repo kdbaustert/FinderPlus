@@ -70,7 +70,7 @@
 	     nobody else can ship FinderPlus's users an update. The private half is in the login
 	     keychain, where release.sh's generate_appcast reads it. -->
 	<key>SUPublicEDKey</key>
-	<string>FYMMALSs2mAccV/rUgQcByyY+mdkpXSBA/nD4JpwvT0=</string>
+	<string>tbrH1nS9bYv31XJbJQtklzDIW0xKz0W2DBF4OENB0A0=</string>
 	<!-- Check daily, but install only when asked; both can be changed in Settings. -->
 	<key>SUEnableAutomaticChecks</key>
 	<true/>

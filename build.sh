@@ -5,7 +5,7 @@
 #   RELEASE=1          keep the update feed in Info.plist; without it the feed is removed, so a
 #                      local build never updates itself out from under its developer
 #   VERSION, BUILD     stamp CFBundleShortVersionString / CFBundleVersion into the built bundle
-#   CODESIGN_IDENTITY  signing identity; ad-hoc when unset
+#   CODESIGN_IDENTITY  signing identity; "FinderPlus Local" when unset, ad-hoc when that is absent
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -136,15 +136,25 @@ fi
 
 # ---------------------------------------------------------------- signing
 #
-# Ad-hoc by default: the app needs no entitlements. The one cost is that macOS keys folder-access
-# prompts (Desktop, Documents, Downloads) to the code hash, so each rebuild may ask again. A stable
-# local identity would stop that — set CODESIGN_IDENTITY.
+# "FinderPlus Local" by default: macOS keys folder-access prompts (Desktop, Documents, Downloads)
+# to the app's designated requirement, and with the same certificate every build that requirement
+# stays put, so the grants survive a rebuild. Ad-hoc when the identity is absent — the requirement
+# then falls back to the code hash, so each rebuild may ask again.
 #
 # Inside out, because an outer signature seals the inner ones: first the bare helper executables in
 # Sparkle (Autoupdate), then its bundles deepest first (XPC services, Updater.app, the framework),
 # then the app. Signed the other way round, the bundle passes a plain verify and fails --deep.
-IDENTITY="${CODESIGN_IDENTITY:--}"
-echo "==> Signing (${IDENTITY/#-/ad-hoc})"
+IDENTITY="${CODESIGN_IDENTITY:-FinderPlus Local}"
+# No `grep -q`: under pipefail an early exit can SIGPIPE `security` and fail a build that has the
+# identity over to the ad-hoc branch. No `-v`: it lists only trusted identities, and a self-signed
+# one is untrusted on a CI runner, where nothing ran add-trusted-cert — codesign signs with it all
+# the same, which release.yml relies on.
+if security find-identity -p codesigning | grep -F -- "$IDENTITY" >/dev/null; then
+    echo "==> Signing as \"$IDENTITY\""
+else
+    echo "==> Signing (ad-hoc — \"$IDENTITY\" not found; folder permissions reset on each build)"
+    IDENTITY="-"
+fi
 while IFS= read -r item; do
     codesign --force --sign "$IDENTITY" "$item"
 done < <(find "$APP/Contents/Frameworks" -type f -perm -u+x ! -path '*/Contents/MacOS/*' \

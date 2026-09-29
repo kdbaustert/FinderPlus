@@ -187,7 +187,8 @@ else
     # it would rewrite their entries to point at this release's download folder, where they don't
     # exist.
     cp "$ZIP" "$STAGING/"
-    APPCAST_ARGS=()
+    # FinderPlus's own key, not the keychain's default account, which is another app's.
+    APPCAST_ARGS=(--account FinderPlus)
     if [[ -n "${SPARKLE_KEY_FILE:-}" ]]; then
         APPCAST_ARGS=(--ed-key-file "$SPARKLE_KEY_FILE")
     fi
