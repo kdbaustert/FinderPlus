@@ -656,7 +656,57 @@ final class SearchModel {
     }
 
     func reveal(_ ids: Set<FileHit.ID>? = nil) {
-        NSWorkspace.shared.activateFileViewerSelecting(targets(ids))
+        Self.revealInNewWindow(targets(ids))
+    }
+
+    /// Shows the files selected in a new Finder window, one window per containing folder.
+    /// `activateFileViewerSelecting` reuses any window already showing the folder, yanking it to
+    /// the front and away from whatever the user had it on; scripting Finder is the only way to
+    /// insist on a fresh window (tabs are not scriptable at all). This rides the same Automation
+    /// permission the Active Finder Window location asks for; when it is off, or Finder stalls
+    /// past the deadline, fall back to the reusing behavior rather than showing nothing.
+    nonisolated private static func revealInNewWindow(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        var parents: [URL] = []
+        var grouped: [URL: [URL]] = [:]
+        for url in urls {
+            let parent = url.deletingLastPathComponent()
+            if grouped[parent] == nil { parents.append(parent) }
+            grouped[parent, default: []].append(url)
+        }
+        func quoted(_ url: URL) -> String {
+            let escaped = url.path
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            return "(POSIX file \"\(escaped)\" as alias)"
+        }
+        var lines = ["tell application \"Finder\"", "activate"]
+        for parent in parents {
+            lines.append("make new Finder window to \(quoted(parent))")
+            lines.append("select {\(grouped[parent, default: []].map(quoted).joined(separator: ", "))}")
+        }
+        lines.append("end tell")
+        let script = lines.joined(separator: "\n")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let fallBack: () -> Void = { Task { @MainActor in NSWorkspace.shared.activateFileViewerSelecting(urls) } }
+            let process = Process()
+            process.executableURL = URL(filePath: "/usr/bin/osascript")
+            process.arguments = ["-e", script]
+            process.standardOutput = Pipe()
+            process.standardError = Pipe()
+            do { try process.run() } catch {
+                fallBack()
+                return
+            }
+            let deadline = Date.now.addingTimeInterval(8)
+            while process.isRunning, Date.now < deadline { usleep(50_000) }
+            if process.isRunning {
+                process.terminate()
+                fallBack()
+            } else if process.terminationStatus != 0 {
+                fallBack()
+            }
+        }
     }
 
     func copyPaths(_ ids: Set<FileHit.ID>? = nil) {
@@ -782,7 +832,7 @@ final class SearchModel {
         case .alertFirstButtonReturn:
             Self.openFullDiskAccessSettings()
         case .alertSecondButtonReturn:
-            NSWorkspace.shared.activateFileViewerSelecting(urls)
+            Self.revealInNewWindow(urls)
         default:
             break
         }
