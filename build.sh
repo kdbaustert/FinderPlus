@@ -5,7 +5,8 @@
 #   RELEASE=1          keep the update feed in Info.plist; without it the feed is removed, so a
 #                      local build never updates itself out from under its developer
 #   VERSION, BUILD     stamp CFBundleShortVersionString / CFBundleVersion into the built bundle
-#   CODESIGN_IDENTITY  signing identity; "FinderPlus Local" when unset, ad-hoc when that is absent
+#   CODESIGN_IDENTITY  signing identity, or - for ad-hoc; "FinderPlus Local" when unset, ad-hoc
+#                      when that is absent. One named here that is absent fails the build
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -148,9 +149,16 @@ IDENTITY="${CODESIGN_IDENTITY:-FinderPlus Local}"
 # No `grep -q`: under pipefail an early exit can SIGPIPE `security` and fail a build that has the
 # identity over to the ad-hoc branch. No `-v`: it lists only trusted identities, and a self-signed
 # one is untrusted on a CI runner, where nothing ran add-trusted-cert — codesign signs with it all
-# the same, which release.yml relies on.
-if security find-identity -p codesigning | grep -F -- "$IDENTITY" >/dev/null; then
+# the same, which release.yml relies on. Only the default falls back: an identity named in
+# CODESIGN_IDENTITY is one the caller counts on, and release.yml names one for every release, where
+# a silent ad-hoc build would ship and drop everyone's grants on update.
+if [[ "$IDENTITY" == "-" ]]; then
+    echo "==> Signing (ad-hoc)"
+elif security find-identity -p codesigning | grep -F -- "$IDENTITY" >/dev/null; then
     echo "==> Signing as \"$IDENTITY\""
+elif [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
+    echo "==> ERROR: CODESIGN_IDENTITY \"$IDENTITY\" is not a code signing identity in the keychain" >&2
+    exit 1
 else
     echo "==> Signing (ad-hoc — \"$IDENTITY\" not found; folder permissions reset on each build)"
     IDENTITY="-"

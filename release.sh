@@ -13,10 +13,11 @@
 # uses the commit count). A BUILD not above every build already in the feed is raised to one that
 # is: two releases with the same build would share, and garble, one feed entry.
 #
-# Releases are ad-hoc signed unless the workflow has a signing identity (see build.sh's
-# CODESIGN_IDENTITY): there is no Developer ID behind them. Gatekeeper flags the first download
-# (right-click → Open, or `xattr -cr` on the app, gets past it once); updates after that arrive
-# through Sparkle, which checks each one against the EdDSA key instead.
+# The workflow signs with its signing identity when it has one and ad-hoc when it doesn't; a hand
+# run signs as "FinderPlus Local" when that certificate is in the keychain (see build.sh's
+# CODESIGN_IDENTITY). Either way there is no Developer ID behind them. Gatekeeper flags the first
+# download (right-click → Open, or `xattr -cr` on the app, gets past it once); updates after that
+# arrive through Sparkle, which checks each one against the EdDSA key instead.
 #
 # Environment:
 #   SPARKLE_KEY_FILE  sign the feed with a private key file instead of the login keychain (the
