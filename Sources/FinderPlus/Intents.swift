@@ -92,7 +92,7 @@ struct FindDuplicateFilesIntent: AppIntent {
             .map { DuplicateFinder.Candidate(id: $0.id, url: $0.url, size: $0.size) }
         // A detached task isn't cancelled with the shortcut, so cancellation is passed on by hand —
         // otherwise hashing a large folder carries on after the user has stopped it.
-        let hashing = Task.detached { DuplicateFinder.sets(in: candidates) }
+        let hashing = Task.detached { DuplicateFinder.sets(in: candidates).sets }
         let sets = await withTaskCancellationHandler {
             await hashing.value
         } onCancel: {
@@ -176,8 +176,11 @@ enum IntentSearch {
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory), isDirectory.boolValue
         else { throw IntentMessage("“\(root.lastPathComponent)” isn’t a folder that can be searched.") }
-        let request = try SearchRequest(
-            roots: [root], query: query, options: options, limits: SearchLimits(maxResults: limit))
+        // The folders to skip and the largest file to read come from Settings, as in a window; the
+        // intent's own limit replaces the match limit.
+        var limits = await MainActor.run { Preferences.shared.settings.limits }
+        limits.maxResults = limit
+        let request = try SearchRequest(roots: [root], query: query, options: options, limits: limits)
         var collected: [FileHit] = []
         for await event in SearchEngine.run(request) {
             if case .hits(let hits) = event { collected += hits }

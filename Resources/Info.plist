@@ -95,7 +95,7 @@
 	<key>NSRemovableVolumesUsageDescription</key>
 	<string>FinderPlus searches removable drives when you search all volumes.</string>
 	<key>NSAppleEventsUsageDescription</key>
-	<string>FinderPlus asks Finder which folder its front window shows, so you can search the Active Finder Window.</string>
+	<string>FinderPlus asks Finder which folder its front window shows, so you can search the Active Finder Window, and has Finder open a new window when you choose Show in Finder.</string>
 	<key>NSNetworkVolumesUsageDescription</key>
 	<string>FinderPlus searches network volumes when you search all volumes.</string>
 </dict>

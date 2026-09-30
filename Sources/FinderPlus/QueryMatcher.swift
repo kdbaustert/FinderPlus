@@ -212,13 +212,20 @@ struct QueryMatcher: @unchecked Sendable {
     }
 
     /// Every place the query's words or patterns occur, for highlighting a whole document in the
-    /// preview. Offsets are in the text as given: NFC's are mapped back, and accent folding keeps
-    /// the length, which it almost always does; `limit` bounds the work on a huge file.
+    /// preview. Offsets are in the text as given, mapped back from the text matched; `limit`
+    /// bounds the work on a huge file.
     func ranges(in text: String, limit: Int = 500) -> [NSRange] {
-        // NFC as `matches` sees it, or a file that matched could highlight nothing. Its changes in
-        // length cannot be undone by a length check (see `snippet`), hence the map.
-        let composition = foldsDiacritics ? nil : Composition(text)
-        let subject = composition?.subject ?? Self.fold(text)
+        // Folded or NFC as `matches` sees it, or a file that matched could highlight nothing.
+        // Folding never lengthens a character (checked across every Unicode scalar), so a folded
+        // text of the same length has every offset where it was: the usual case, left unmapped,
+        // since the map costs twenty times the fold (206 ms against 10 on a megabyte of French). A
+        // shorter one lost a decomposed accent's combining mark, and every match after "e\u{301}"
+        // would land early. NFC can lengthen one sequence and shorten another, so a length check
+        // proves nothing there (see `snippet`). Both of those are mapped back.
+        let folded = foldsDiacritics ? Self.fold(text) : nil
+        let composition = folded?.utf16.count == text.utf16.count ? nil : Composition(
+            text, as: foldsDiacritics ? Self.fold : { $0.precomposedStringWithCanonicalMapping })
+        let subject = composition?.subject ?? folded ?? text
         let whole = NSRange(location: 0, length: (subject as NSString).length)
         var found: [NSRange] = []
         for pattern in clauses.flatMap(\.required) {
@@ -244,22 +251,26 @@ struct QueryMatcher: @unchecked Sendable {
         return composition.map { composition in sorted.map(composition.original) } ?? sorted
     }
 
-    /// Text in NFC, and the way back: where each sequence NFC changed sits in the text as given.
+    /// Text as matching sees it — in NFC, or with accents folded — and the way back: where each
+    /// sequence the transform changed sits in the text as given.
     private struct Composition {
         let subject: String
-        /// The composed character sequences NFC changed, in order: UTF-16 offsets in `subject`
-        /// and in the original text.
+        /// The composed character sequences the transform changed, in order: UTF-16 offsets in
+        /// `subject` and in the original text.
         private var changed: [(subject: Range<Int>, original: Range<Int>)] = []
 
-        init(_ text: String) {
-            let composed = text.precomposedStringWithCanonicalMapping
+        /// `transform` must work character by character, as NFC and accent folding do, so that
+        /// applying it one sequence at a time gives the same text as applying it to the whole.
+        init(_ text: String, as transform: (String) -> String) {
+            let composed = transform(text)
             // Code units, not `==`: String equality is canonical equivalence, true either way.
             guard !composed.utf16.elementsEqual(text.utf16) else {
                 subject = text
                 return
             }
-            // Composed sequence by sequence, so every change stays inside one sequence and the map
-            // is exact by construction. Two ASCII units in a row never compose: skipped cheaply.
+            // Sequence by sequence, so every change stays inside one sequence and the map is exact
+            // by construction. Two ASCII units in a row neither compose nor carry an accent:
+            // skipped cheaply.
             let original = text as NSString
             let units = Array(text.utf16)
             var built = ""
@@ -273,7 +284,7 @@ struct QueryMatcher: @unchecked Sendable {
                 }
                 let range = original.rangeOfComposedCharacterSequence(at: location)
                 let piece = original.substring(with: range)
-                let normalized = piece.precomposedStringWithCanonicalMapping
+                let normalized = transform(piece)
                 if !normalized.utf16.elementsEqual(piece.utf16) {
                     built += original.substring(
                         with: NSRange(location: unchangedFrom, length: range.location - unchangedFrom))
@@ -290,7 +301,7 @@ struct QueryMatcher: @unchecked Sendable {
         }
 
         /// A range in `subject` as one in the original, widened to whole sequences rather than
-        /// splitting one NFC changed.
+        /// splitting one the transform changed.
         func original(_ range: NSRange) -> NSRange {
             guard !changed.isEmpty else { return range }
             let start = offset(range.location, roundingUp: false)

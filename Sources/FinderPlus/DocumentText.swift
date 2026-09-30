@@ -25,7 +25,9 @@ enum DocumentText {
 
     /// Streams the members out with `unzip -p`, stopping once `maxBytes` have been read, and
     /// returns their text without markup.
-    static func zipText(of url: URL, members: [String], maxBytes: Int) -> String? {
+    static func zipText(
+        of url: URL, members: [String], maxBytes: Int, isStopped: () -> Bool = { Task.isCancelled }
+    ) -> String? {
         let process = Process()
         process.executableURL = URL(filePath: "/usr/bin/unzip")
         process.arguments = ["-p", url.path] + members
@@ -34,14 +36,14 @@ enum DocumentText {
         process.standardError = FileHandle.nullDevice
         do { try process.run() } catch { return nil }
         var data = Data()
-        while data.count < maxBytes, !Task.isCancelled,
+        while data.count < maxBytes, !isStopped(),
               let chunk = try? output.fileHandleForReading.read(upToCount: 1 << 16), !chunk.isEmpty
         {
             data.append(chunk)
         }
         if process.isRunning { process.terminate() }
         process.waitUntilExit()
-        guard !data.isEmpty, !Task.isCancelled else { return nil }
+        guard !data.isEmpty, !isStopped() else { return nil }
         return markupText(String(decoding: data, as: UTF8.self))
     }
 
@@ -63,10 +65,11 @@ enum DocumentText {
 
     /// Text read out of an image. The image is loaded no larger than 3000 pixels on its longest
     /// side: enough for Vision to read body text, without decoding a 50-megapixel photo whole.
-    static func recognizedText(inImageAt url: URL) -> String? {
+    static func recognizedText(inImageAt url: URL, isStopped: () -> Bool = { Task.isCancelled }) -> String? {
         // Checked before decoding and recognition, which cannot be interrupted once started: a
-        // preview that has moved on must not keep a core busy on text nobody will see.
-        guard !Task.isCancelled, let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        // preview that has moved on, or a search that was stopped, must not keep a core busy on
+        // text nobody will see.
+        guard !isStopped(), let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceThumbnailMaxPixelSize: 3000,
@@ -78,10 +81,12 @@ enum DocumentText {
 
     /// A scanned PDF has pages but no text layer; each page is rendered and read like an image.
     /// Long scans stop at `maxPages`, which bounds how long one file can hold up a search.
-    static func recognizedText(inScannedPDF document: PDFDocument, maxPages: Int = 30) -> String? {
+    static func recognizedText(
+        inScannedPDF document: PDFDocument, maxPages: Int = 30, isStopped: () -> Bool = { Task.isCancelled }
+    ) -> String? {
         var pages: [String] = []
         for index in 0..<min(document.pageCount, maxPages) {
-            if Task.isCancelled { return nil }
+            if isStopped() { return nil }
             guard let page = document.page(at: index) else { continue }
             let bounds = page.bounds(for: .mediaBox)
             let scale = min(2.5, 2500 / max(bounds.width, bounds.height, 1))

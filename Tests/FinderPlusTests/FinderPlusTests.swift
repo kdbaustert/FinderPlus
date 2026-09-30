@@ -114,6 +114,37 @@ final class QueryMatcherTests: XCTestCase {
         XCTAssertTrue(snippet.text.hasPrefix("…"))
         XCTAssertFalse(snippet.text.contains("\n"))
     }
+
+    // NFC changes the text's length, so the highlight has to be mapped back to the text as given.
+    func testRangesAfterADecomposedAccentCoverTheMatchInTheOriginalText() throws {
+        let text = "re\u{301}sume\u{301} then a cat sat"
+        let expected = (text as NSString).range(of: "cat")
+        XCTAssertNotEqual(expected.location, NSNotFound)
+        // Both settings: folding drops the two combining accents, NFC composes them, and either
+        // way the text matched is two units shorter than the text shown.
+        for ignoreDiacritics in [false, true] {
+            let m = try matcher("cat", anchors: false) { $0.ignoreDiacritics = ignoreDiacritics }
+            let found = m.ranges(in: text)
+            XCTAssertEqual(found, [expected], "ignoreDiacritics: \(ignoreDiacritics)")
+            XCTAssertEqual(found.map { (text as NSString).substring(with: $0) }, ["cat"])
+        }
+        // A match on the accented word itself covers its combining marks too.
+        let folded = try matcher("resume", anchors: false) { $0.ignoreDiacritics = true }
+        XCTAssertEqual(
+            folded.ranges(in: text).map { (text as NSString).substring(with: $0) }, ["re\u{301}sume\u{301}"])
+    }
+
+    // An unanchored `a*z` is the `.pieces` path: each piece after the one before, on one line.
+    func testRangesOfAWholeWordWildcardStayOnOneLine() throws {
+        let m = try matcher("a*z", anchors: false) {
+            $0.mode = .wildcards
+            $0.wholeWords = true
+        }
+        let text = "a to z\nazure sky\nno match here"
+        let found = m.ranges(in: text).map { (text as NSString).substring(with: $0) }
+        XCTAssertEqual(found, ["a to z"])
+        XCTAssertEqual(m.ranges(in: "azure sky\nno match here"), [])
+    }
 }
 
 final class SearchLocationTests: XCTestCase {
@@ -801,6 +832,40 @@ final class DocumentTextTests: XCTestCase {
         // With several words, the highlight marks where the first one matched.
         XCTAssertEqual(hits.first.map { ($0.snippetText as NSString).substring(with: $0.snippet!.match) }, "EOS")
     }
+
+    func testAStoppedReadReturnsNothing() throws {
+        let text = root.appending(path: "notes.txt")
+        try "plain words".write(to: text, atomically: true, encoding: .utf8)
+        XCTAssertEqual(SearchEngine.contentText(of: text, size: 11, isStopped: { false }), "plain words")
+        XCTAssertNil(SearchEngine.contentText(of: text, size: 11, isStopped: { true }))
+
+        let docx = try makeZip("book.xlsx", ["xl/sharedStrings.xml": "<sst><si><t>Quarterly</t></si></sst>"])
+        let members = try XCTUnwrap(DocumentText.zipMembers(forExtension: "xlsx"))
+        let maxBytes = SearchLimits().maxContentBytes
+        XCTAssertNotNil(DocumentText.zipText(of: docx, members: members, maxBytes: maxBytes, isStopped: { false }))
+        XCTAssertNil(DocumentText.zipText(of: docx, members: members, maxBytes: maxBytes, isStopped: { true }))
+    }
+
+    func testABinaryFileIsTurnedDownButUTF16TextIsRead() throws {
+        let binary = root.appending(path: "blob.zzqx")
+        try Data([0x41, 0x42, 0x00, 0x43, 0x44]).write(to: binary)
+        XCTAssertNil(SearchEngine.contentText(of: binary, size: 5))
+
+        let utf16 = root.appending(path: "wide.zzqx")
+        let data = try XCTUnwrap("hello wide world".data(using: .utf16))
+        XCTAssertTrue(data.contains(0), "UTF-16 of ASCII text carries NUL bytes")
+        try data.write(to: utf16)
+        XCTAssertEqual(SearchEngine.contentText(of: utf16, size: Int64(data.count)), "hello wide world")
+    }
+
+    func testIsBinaryLooksForANulInTheFirst8KBUnlessThereIsAUTF16Mark() {
+        XCTAssertTrue(SearchEngine.isBinary(Data([0x41, 0x00, 0x42])))
+        XCTAssertFalse(SearchEngine.isBinary(Data("plain text".utf8)))
+        XCTAssertFalse(SearchEngine.isBinary(Data([0xFF, 0xFE, 0x41, 0x00])))
+        XCTAssertFalse(SearchEngine.isBinary(Data([0xFE, 0xFF, 0x00, 0x41])))
+        XCTAssertFalse(SearchEngine.isBinary(Data(repeating: 0x41, count: 8192) + Data([0x00])))
+        XCTAssertTrue(SearchEngine.isBinary(Data(repeating: 0x41, count: 8191) + Data([0x00])))
+    }
 }
 
 @MainActor
@@ -1002,6 +1067,101 @@ final class ResultActionTests: XCTestCase {
         let found = matcher.ranges(in: text).map { (text as NSString).substring(with: $0) }
         XCTAssertEqual(found, ["cat", "cat", "Cat"])
     }
+
+    // A kept row used to show the last run's size until something else replaced it.
+    func testFindAgainShowsTheFilesNewSize() async throws {
+        let file = try write("grow.txt", "12345")
+        let model = SearchModel(defaults: defaults)
+        model.locationID = root.path
+        model.query = "grow"
+        model.start()
+        try await finish(model)
+        XCTAssertEqual(model.results.map(\.size), [5])
+        let id = try XCTUnwrap(model.results.first?.id)
+        model.selection = [id]
+
+        try String(repeating: "x", count: 5000).write(to: file, atomically: true, encoding: .utf8)
+        model.start()
+        try await finish(model)
+        XCTAssertEqual(model.results.map(\.name), ["grow.txt"])
+        XCTAssertEqual(model.results.map(\.size), [5000])
+        // Still selected, so the row was kept rather than dropped and found again — which needs
+        // the roots compared canonically, as this temporary folder is under /var.
+        XCTAssertEqual(model.selection, [id])
+    }
+
+    func testFindAgainDropsAKeptRowThatNoLongerPassesTheSizeFilter() async throws {
+        let file = try write("grow.txt", "12345")
+        _ = try write("grow-small.txt", "12345")
+        let model = SearchModel(defaults: defaults)
+        model.locationID = root.path
+        model.query = "grow"
+        model.options.size = .under1MB
+        model.start()
+        try await finish(model)
+        XCTAssertEqual(model.results.map(\.name).sorted(), ["grow-small.txt", "grow.txt"])
+
+        try String(repeating: "x", count: 1_000_001).write(to: file, atomically: true, encoding: .utf8)
+        model.start()
+        try await finish(model)
+        XCTAssertEqual(model.results.map(\.name), ["grow-small.txt"])
+    }
+
+    func testStopEndsFindDuplicates() async throws {
+        _ = try write("a/photo.jpg", "same bytes")
+        _ = try write("b/photo copy.jpg", "same bytes")
+        let model = SearchModel(defaults: defaults)
+        model.locationID = root.path
+        model.query = "jpg"
+        model.start()
+        try await finish(model)
+        XCTAssertEqual(model.results.count, 2)
+
+        model.findDuplicates()
+        XCTAssertTrue(model.isFindingDuplicates)
+        model.stop()
+        XCTAssertFalse(model.isFindingDuplicates)
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertFalse(model.isFindingDuplicates)
+        XCTAssertFalse(model.showsDuplicates, "a stopped hash must not bring up the duplicates view")
+        XCTAssertEqual(model.results.count, 2)
+    }
+
+    func testMovingAFileIntoItsOwnFolderLeavesItAlone() throws {
+        let file = try write("in/Report.pdf", "x")
+        let outcome = SearchModel.perform(.move, [file], into: file.deletingLastPathComponent())
+        XCTAssertEqual(outcome.failed, [])
+        XCTAssertEqual(outcome.done[file], file)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: file.deletingLastPathComponent().path), ["Report.pdf"])
+    }
+
+    func testDuplicateFinderCountsFilesItCouldNotRead() throws {
+        let one = try write("one.txt", "same bytes")
+        let two = try write("two.txt", "same bytes")
+        func candidate(_ url: URL) -> DuplicateFinder.Candidate {
+            DuplicateFinder.Candidate(id: url.path, url: url, size: 10)
+        }
+
+        let readable = DuplicateFinder.sets(in: [candidate(one), candidate(two)])
+        XCTAssertEqual(readable.sets.map { Set($0) }, [[one.path, two.path]])
+        XCTAssertEqual(readable.unread, 0)
+
+        let manager = FileManager.default
+        try manager.setAttributes([.posixPermissions: 0o000], ofItemAtPath: two.path)
+        defer { try? manager.setAttributes([.posixPermissions: 0o644], ofItemAtPath: two.path) }
+        let unreadable = DuplicateFinder.sets(in: [candidate(one), candidate(two)])
+        XCTAssertEqual(unreadable.sets, [])
+        XCTAssertEqual(unreadable.unread, 1)
+    }
+
+    func testDigestNeedsTheFilesRealSize() throws {
+        let file = try write("digest.txt", "hello")
+        let digest = try XCTUnwrap(DuplicateFinder.digest(of: file, limit: nil, size: 5))
+        XCTAssertEqual(digest.count, 64)
+        XCTAssertNotNil(digest.wholeMatch(of: /[0-9a-f]{64}/))
+        XCTAssertNil(DuplicateFinder.digest(of: file, limit: nil, size: 6))
+    }
 }
 
 final class BatchRenameTests: XCTestCase {
@@ -1050,6 +1210,99 @@ final class BatchRenameTests: XCTestCase {
         XCTAssertEqual(recipe.newName(for: "report.txt", at: 0, on: noon), "2026-09-27 report.txt")
         recipe.datePosition = .after
         XCTAssertEqual(recipe.newName(for: "report.txt", at: 0, on: noon), "report 2026-09-27.txt")
+    }
+
+    /// A temp folder that goes at the end of the test, locked files included.
+    private func makeFolder() throws -> URL {
+        let manager = FileManager.default
+        let folder = manager.temporaryDirectory.appending(path: "FinderPlusPlan-\(UUID().uuidString)")
+        try manager.createDirectory(at: folder, withIntermediateDirectories: true)
+        addTeardownBlock {
+            let entries = manager.enumerator(at: folder, includingPropertiesForKeys: nil)
+            for case let url as URL in entries?.allObjects ?? [] {
+                try? manager.setAttributes([.immutable: false], ofItemAtPath: url.path)
+            }
+            try? manager.removeItem(at: folder)
+        }
+        return folder
+    }
+
+    private func hit(_ folder: URL, _ path: String, isFolder: Bool = false) throws -> FileHit {
+        let url = folder.appending(path: path)
+        if isFolder {
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        } else {
+            try "x".write(to: url, atomically: true, encoding: .utf8)
+        }
+        return FileHit(url: url, name: url.lastPathComponent, isFolder: isFolder, size: isFolder ? -1 : 1,
+                       modified: .now, kind: isFolder ? "Folder" : "Text")
+    }
+
+    private func replacing(_ find: String, with replacement: String) -> BatchRename.Recipe {
+        var recipe = BatchRename.Recipe()
+        recipe.action = .replaceText
+        recipe.find = find
+        recipe.replacement = replacement
+        return recipe
+    }
+
+    func testPlanFlagsTwoRowsThatWouldGetTheSameNameEvenIfOnlyCaseDiffers() throws {
+        let folder = try makeFolder()
+        let hits = [try hit(folder, "Foo1.txt"), try hit(folder, "foo11.txt")]
+        let plan = BatchRename.plan(hits, recipe: replacing("1", with: ""))
+        XCTAssertEqual(plan.map(\.name), ["Foo.txt", "foo.txt"])
+        XCTAssertEqual(plan.map(\.problem), Array(repeating: "Two items would get this name", count: 2))
+    }
+
+    func testPlanFlagsAnExistingFileOutsideTheBatch() throws {
+        let folder = try makeFolder()
+        _ = try hit(folder, "existing.txt")
+        let plan = BatchRename.plan([try hit(folder, "old.txt")], recipe: replacing("old", with: "existing"))
+        XCTAssertEqual(plan.map(\.problem), ["A file with this name already exists"])
+    }
+
+    func testPlanFlagsARowInsideAFolderTheBatchRenames() throws {
+        let folder = try makeFolder()
+        let dir = try hit(folder, "dir", isFolder: true)
+        let inside = try hit(folder, "dir/x.txt")
+        var recipe = BatchRename.Recipe()
+        recipe.action = .changeCase
+        recipe.caseStyle = .uppercase
+        let plan = BatchRename.plan([dir, inside], recipe: recipe)
+        XCTAssertEqual(plan.map(\.name), ["DIR", "X.txt"])
+        XCTAssertNil(plan[0].problem)
+        XCTAssertEqual(plan[1].problem, "Inside a folder that is also being renamed")
+    }
+
+    func testPlanFlagsALockedFile() throws {
+        let folder = try makeFolder()
+        let locked = try hit(folder, "lock.txt")
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: locked.url.path)
+        var recipe = BatchRename.Recipe()
+        recipe.action = .changeCase
+        recipe.caseStyle = .uppercase
+        XCTAssertEqual(BatchRename.plan([locked], recipe: recipe).map(\.problem), ["File is locked"])
+    }
+
+    func testPlanLeavesAnUnchangedNameAloneAndAllowsASwap() throws {
+        let folder = try makeFolder()
+        let same = try hit(folder, "same.txt")
+        var lower = BatchRename.Recipe()
+        lower.action = .changeCase
+        lower.caseStyle = .lowercase
+        let unchanged = try XCTUnwrap(BatchRename.plan([same], recipe: lower).first)
+        XCTAssertNil(unchanged.problem)
+        XCTAssertFalse(unchanged.changes)
+
+        // Numbered in list order, "F 2" becomes "F 1" and "F 1" becomes "F 2".
+        var recipe = BatchRename.Recipe()
+        recipe.action = .sequence
+        recipe.base = "F"
+        recipe.start = 1
+        let swapped = BatchRename.plan([try hit(folder, "F 2.txt"), try hit(folder, "F 1.txt")], recipe: recipe)
+        XCTAssertEqual(swapped.map(\.name), ["F 1.txt", "F 2.txt"])
+        XCTAssertEqual(swapped.map(\.problem), [nil, nil])
+        XCTAssertEqual(swapped.map(\.changes), [true, true])
     }
 
     func testProblemsCatchUnusableNames() {

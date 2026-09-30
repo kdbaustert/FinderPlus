@@ -252,6 +252,10 @@ final class SearchModel {
     @ObservationIgnored private var lastRun: Run?
     /// IDs already in `results`, so a hit carried over from the previous run is not added twice.
     @ObservationIgnored private var knownIDs: Set<FileHit.ID> = []
+    /// Rows kept from the previous run that this walk has not reported yet. Each still shows the
+    /// size and dates of the last run: the fresh hit replaces it, and one never reported is dropped
+    /// when the walk ends.
+    @ObservationIgnored private var unconfirmed: Set<FileHit.ID> = []
 
     /// What decides whether the rows on screen would all be found again: the folders actually
     /// walked (so a different front Finder window or an ejected drive counts as a change), the
@@ -338,9 +342,15 @@ final class SearchModel {
                 refine = self.refinable(for: request)
             }
             // Off the main actor: one existence check per row stalls the window on a network volume.
-            let rows = refine.rows
+            // A row moved outside the roots since is not kept: the walk would never report it. The
+            // roots as the walk reports them — a root under /var is walked as /private/var.
+            let (rows, roots) = (refine.rows, request.roots)
             let kept = await Self.offMain {
-                rows.filter { !Task.isCancelled && FileManager.default.fileExists(atPath: $0.url.path) }
+                let prefixes = roots.map(SearchEngine.walkedPath).map { $0.hasSuffix("/") ? $0 : $0 + "/" }
+                return rows.filter { hit in
+                    !Task.isCancelled && prefixes.contains { hit.url.path.hasPrefix($0) }
+                        && FileManager.default.fileExists(atPath: hit.url.path)
+                }
             }
             guard !Task.isCancelled else { return }
             self?.adopt(kept, for: refine.run)
@@ -351,24 +361,21 @@ final class SearchModel {
                 self.apply(event)
             }
             guard !Task.isCancelled else { return }
+            self?.dropUnconfirmed()
             self?.phase = .finished(started.duration(to: .now))
         }
     }
 
-    /// The rows on screen the new walk is certain to report again, still to be checked on disk.
-    /// Content searches never keep rows — a kept row would keep the old query's snippet — and
-    /// neither do searches with a match limit, which kept rows could push past. A row moved
-    /// outside the roots since is not kept either: the walk would never report it. Nor is an
-    /// archive entry: the zip still existing says nothing of the entry, and the walk re-lists it.
+    /// The rows on screen the new walk should report again, still to be checked on disk and
+    /// against the roots. Content searches never keep rows — a kept row would keep the old
+    /// query's snippet — and neither do searches with a match limit, which kept rows could push
+    /// past. Nor is an archive entry: the zip still existing says nothing of the entry, and the
+    /// walk re-lists it.
     private func refinable(for request: SearchRequest) -> (run: Run, rows: [FileHit]) {
         let run = Run(roots: request.roots.map(\.path), options: request.options, limits: request.limits)
         guard lastRun == run, run.options.searchNames, !run.options.readsInsideFiles, run.limits.maxResults == 0
         else { return (run, []) }
-        let roots = run.roots.map { $0.hasSuffix("/") ? $0 : $0 + "/" }
-        let rows = results.filter { hit in
-            !hit.isArchiveEntry && request.nameMatcher.matches(hit.name)
-                && roots.contains { hit.url.path.hasPrefix($0) }
-        }
+        let rows = results.filter { !$0.isArchiveEntry && request.nameMatcher.matches($0.name) }
         return (run, rows)
     }
 
@@ -380,7 +387,18 @@ final class SearchModel {
         results = rows
         resort()
         knownIDs = Set(results.map(\.id))
+        unconfirmed = knownIDs
         selection.formIntersection(knownIDs)
+    }
+
+    /// Kept rows the finished walk never reported: moved within the roots, or changed so they no
+    /// longer pass the filters.
+    private func dropUnconfirmed() {
+        guard !unconfirmed.isEmpty else { return }
+        results.removeAll { unconfirmed.contains($0.id) }
+        knownIDs.subtract(unconfirmed)
+        selection.subtract(unconfirmed)
+        unconfirmed = []
     }
 
     /// A failed search clears its rows, and the selection and duplicates view with them, so no
@@ -401,7 +419,13 @@ final class SearchModel {
         return await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
     }
 
+    /// Ends the search, and Find Duplicates' hashing with it: a closed window calls this, and
+    /// either would otherwise go on reading the disk unseen.
     func stop() {
+        if isFindingDuplicates {
+            duplicateTask?.cancel()
+            isFindingDuplicates = false
+        }
         guard isSearching else { return }
         searchTask?.cancel()
         searchTask = nil
@@ -451,6 +475,15 @@ final class SearchModel {
     /// is found by binary search: comparing it against every row on screen instead fell behind the
     /// walk at around 200,000 results.
     private func insertSorted(_ hits: [FileHit]) {
+        if !unconfirmed.isEmpty {
+            // A kept row makes way for its fresh hit, which is merged in below like any other.
+            var refreshed: Set<FileHit.ID> = []
+            for hit in hits where unconfirmed.remove(hit.id) != nil { refreshed.insert(hit.id) }
+            if !refreshed.isEmpty {
+                results.removeAll { refreshed.contains($0.id) }
+                knownIDs.subtract(refreshed)
+            }
+        }
         let batch = hits.filter { knownIDs.insert($0.id).inserted }.sorted(by: precedes)
         guard !batch.isEmpty else { return }
         var merged: [FileHit] = []
@@ -539,29 +572,13 @@ final class SearchModel {
             """
         let path: String = try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                let process = Process()
-                process.executableURL = URL(filePath: "/usr/bin/osascript")
-                process.arguments = ["-e", script]
-                let output = Pipe()
-                let errors = Pipe()
-                process.standardOutput = output
-                process.standardError = errors
-                do { try process.run() } catch {
+                guard let run = runAppleScript(script, keepingOutput: true) else {
                     continuation.resume(throwing: LocationError.finderTimedOut)
                     return
                 }
-                let deadline = Date.now.addingTimeInterval(8)
-                while process.isRunning, Date.now < deadline { usleep(50_000) }
-                if process.isRunning {
-                    process.terminate()
-                    continuation.resume(throwing: LocationError.finderTimedOut)
-                    return
-                }
-                let answer = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-                let problem = String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-                if process.terminationStatus == 0 {
-                    continuation.resume(returning: answer.trimmingCharacters(in: .whitespacesAndNewlines))
-                } else if problem.contains("-1743") {
+                if run.status == 0 {
+                    continuation.resume(returning: run.output.trimmingCharacters(in: .whitespacesAndNewlines))
+                } else if run.errors.contains("-1743") {
                     // errAEEventNotPermitted: the Automation permission is off.
                     continuation.resume(throwing: LocationError.finderAccessDenied)
                 } else {
@@ -570,6 +587,33 @@ final class SearchModel {
             }
         }
         return URL(filePath: path, directoryHint: .isDirectory)
+    }
+
+    /// Runs an AppleScript with `osascript`, blocking for up to eight seconds: nil when it could
+    /// not start or was still running then — a busy Finder, or an Automation prompt nobody has
+    /// answered — and is stopped. Output is read once the script has exited, so it is kept only
+    /// when asked for; a script printing more than a pipe holds would stall until the deadline.
+    nonisolated private static func runAppleScript(
+        _ script: String, keepingOutput: Bool = false
+    ) -> (status: Int32, output: String, errors: String)? {
+        let process = Process()
+        process.executableURL = URL(filePath: "/usr/bin/osascript")
+        process.arguments = ["-e", script]
+        let output = Pipe()
+        let errors = Pipe()
+        process.standardOutput = keepingOutput ? output : FileHandle.nullDevice
+        process.standardError = errors
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
+        do { try process.run() } catch { return nil }
+        guard exited.wait(timeout: .now() + 8) == .success else {
+            process.terminate()
+            return nil
+        }
+        func text(_ pipe: Pipe) -> String {
+            String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        }
+        return (process.terminationStatus, keepingOutput ? text(output) : "", text(errors))
     }
 
     private func remember(_ query: String) {
@@ -664,16 +708,28 @@ final class SearchModel {
     /// the front and away from whatever the user had it on; scripting Finder is the only way to
     /// insist on a fresh window (tabs are not scriptable at all). This rides the same Automation
     /// permission the Active Finder Window location asks for; when it is off, or Finder stalls
-    /// past the deadline, fall back to the reusing behavior rather than showing nothing.
+    /// past the deadline, fall back to the reusing behavior rather than showing nothing. A symlink
+    /// always goes that way: `POSIX file … as alias` resolves the link, so Finder would select the
+    /// file it points to rather than the link that was found.
     nonisolated private static func revealInNewWindow(_ urls: [URL]) {
-        guard !urls.isEmpty else { return }
+        var links: [URL] = []
+        var files: [URL] = []
         var parents: [URL] = []
         var grouped: [URL: [URL]] = [:]
         for url in urls {
+            if (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
+                links.append(url)
+                continue
+            }
+            files.append(url)
             let parent = url.deletingLastPathComponent()
             if grouped[parent] == nil { parents.append(parent) }
             grouped[parent, default: []].append(url)
         }
+        if !links.isEmpty {
+            Task { @MainActor [links] in NSWorkspace.shared.activateFileViewerSelecting(links) }
+        }
+        guard !files.isEmpty else { return }
         func quoted(_ url: URL) -> String {
             let escaped = url.path
                 .replacingOccurrences(of: "\\", with: "\\\\")
@@ -687,25 +743,9 @@ final class SearchModel {
         }
         lines.append("end tell")
         let script = lines.joined(separator: "\n")
-        DispatchQueue.global(qos: .userInitiated).async {
-            let fallBack: () -> Void = { Task { @MainActor in NSWorkspace.shared.activateFileViewerSelecting(urls) } }
-            let process = Process()
-            process.executableURL = URL(filePath: "/usr/bin/osascript")
-            process.arguments = ["-e", script]
-            process.standardOutput = Pipe()
-            process.standardError = Pipe()
-            do { try process.run() } catch {
-                fallBack()
-                return
-            }
-            let deadline = Date.now.addingTimeInterval(8)
-            while process.isRunning, Date.now < deadline { usleep(50_000) }
-            if process.isRunning {
-                process.terminate()
-                fallBack()
-            } else if process.terminationStatus != 0 {
-                fallBack()
-            }
+        DispatchQueue.global(qos: .userInitiated).async { [files] in
+            guard runAppleScript(script)?.status != 0 else { return }
+            Task { @MainActor in NSWorkspace.shared.activateFileViewerSelecting(files) }
         }
     }
 
@@ -741,7 +781,17 @@ final class SearchModel {
         Self.batchesInFlight += 1
         defer { Self.batchesInFlight -= 1 }
         let outcome = await Self.recycle(urls)
-        results.removeAll { outcome.trashed.contains($0.url) }
+        // Rows inside a trashed folder go with it, found by walking each row's path up, as
+        // `relocate` does: one set lookup per level rather than a prefix test per trashed item.
+        let trashed = Set(outcome.trashed.map(\.path))
+        results.removeAll { hit in
+            var path = hit.url.path
+            while !path.isEmpty, path != "/" {
+                if trashed.contains(path) { return true }
+                path = (path as NSString).deletingLastPathComponent
+            }
+            return false
+        }
         let remaining = Set(results.map(\.id))
         selection.formIntersection(remaining)
         knownIDs.formIntersection(remaining)
@@ -968,6 +1018,14 @@ final class SearchModel {
     nonisolated static func perform(_ kind: Transfer, _ sources: [URL], into folder: URL) -> TransferOutcome {
         var outcome = TransferOutcome()
         for source in sources {
+            // Moved to where it already is, a file stays put: `availableName` would count the file
+            // itself as taken and rename it "Report 2.pdf".
+            if kind == .move,
+               source.deletingLastPathComponent().resolvingSymlinksInPath().path == folder.resolvingSymlinksInPath().path
+            {
+                outcome.done[source] = source
+                continue
+            }
             let target = availableName(for: source.lastPathComponent, in: folder)
             do {
                 switch kind {
@@ -1205,13 +1263,23 @@ final class SearchModel {
         isFindingDuplicates = true
         duplicateTask = Task { [weak self] in
             // Cancelled with this task, so a new search stops the hashing rather than outliving it.
-            let sets = await Self.offMain { DuplicateFinder.sets(in: candidates) }
+            let found = await Self.offMain { DuplicateFinder.sets(in: candidates) }
             guard let self, !Task.isCancelled else { return }
             isFindingDuplicates = false
+            // The rows as they are now, not as they were when hashing began: a file renamed, moved
+            // or trashed meanwhile keeps that change. One renamed or moved has a new ID and leaves
+            // its set, and a set down to a single file is no set.
+            if resultsBeforeDuplicates != nil { leaveDuplicates() }
+            let current = results
+            let present = Set(current.map(\.id))
+            let sets = found.sets.map { $0.filter(present.contains) }.filter { $0.count > 1 }
             guard !sets.isEmpty else {
                 let alert = NSAlert()
                 alert.messageText = "No duplicates"
-                alert.informativeText = "None of these \(candidates.count.formatted()) files have the same contents as another."
+                alert.informativeText = "None of these \((candidates.count - found.unread).formatted()) files have the same contents as another."
+                if found.unread > 0 {
+                    alert.informativeText += " \(found.unread.formatted()) more couldn’t be read — not downloaded from iCloud, or not readable — so weren’t compared."
+                }
                 alert.runModal()
                 return
             }
@@ -1219,9 +1287,9 @@ final class SearchModel {
             for (index, set) in sets.enumerated() {
                 for id in set { numbers[id] = index + 1 }
             }
-            resultsBeforeDuplicates = base
+            resultsBeforeDuplicates = current
             duplicateSets = numbers
-            results = base.filter { numbers[$0.id] != nil }
+            results = current.filter { numbers[$0.id] != nil }
                 .sorted { (numbers[$0.id]!, $0.name) < (numbers[$1.id]!, $1.name) }
             selection.formIntersection(Set(results.map(\.id)))
         }

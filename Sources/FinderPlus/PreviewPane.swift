@@ -86,12 +86,19 @@ private struct MatchesPreview: View {
             // Held and cancelled by hand: a detached task outlives this view's task, so arrowing
             // through results would otherwise pile up full extractions (OCR ones especially).
             let extraction = Task.detached { () -> (text: String, ranges: [NSRange])? in
-                let full = SearchEngine.contentText(
-                    of: url, size: size, maxBytes: maxBytes, recognizeText: context.recognizeText)
-                    ?? DocumentText.metadataText(of: url)
-                guard let full, !Task.isCancelled else { return nil }
-                let text = (full as NSString).length > 1_000_000 ? (full as NSString).substring(to: 1_000_000) : full
-                return (text, context.matcher.ranges(in: text))
+                func marked(_ full: String?) -> (text: String, ranges: [NSRange])? {
+                    guard let full, !Task.isCancelled else { return nil }
+                    let text = (full as NSString).length > 1_000_000 ? (full as NSString).substring(to: 1_000_000) : full
+                    return (text, context.matcher.ranges(in: text))
+                }
+                let contents = marked(SearchEngine.contentText(
+                    of: url, size: size, maxBytes: maxBytes, recognizeText: context.recognizeText))
+                if let contents, !contents.ranges.isEmpty { return contents }
+                // A file found by its metadata — owner, permissions — shows that, rather than a body
+                // with nothing marked in it.
+                let metadata = marked(DocumentText.metadataText(of: url))
+                if let metadata, !metadata.ranges.isEmpty { return metadata }
+                return contents ?? metadata
             }
             loaded = await withTaskCancellationHandler {
                 await extraction.value

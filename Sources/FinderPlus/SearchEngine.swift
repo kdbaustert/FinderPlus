@@ -31,17 +31,24 @@ struct FileHit: Identifiable, Hashable, Sendable {
         self.created = created
         self.kind = kind
         self.snippet = snippet
+        // Stored, not computed: the selection lookup reads every row's ID and the Location sort
+        // reads `parentPath` per comparison, and each read built a new string. For an ordinary
+        // file the ID and full path share one string.
+        let path = url.path
+        id = archiveEntry.map { path + "\u{0}" + $0 } ?? path
+        fullPath = archiveEntry.map { path + "/" + $0 } ?? path
+        parentPath = (fullPath as NSString).deletingLastPathComponent
     }
 
     /// Unique per row: every entry of an archive shares the archive's URL.
-    var id: String { archiveEntry.map { url.path + "\u{0}" + $0 } ?? url.path }
+    let id: String
     var isArchiveEntry: Bool { archiveEntry != nil }
     var snippetText: String { snippet?.text ?? "" }
 
     /// The file's path; for an archive entry, the archive's path followed by the entry's.
-    var fullPath: String { archiveEntry.map { url.path + "/" + $0 } ?? url.path }
+    let fullPath: String
 
-    var parentPath: String { (fullPath as NSString).deletingLastPathComponent }
+    let parentPath: String
 
     var displayParent: String {
         let home = NSHomeDirectory()
@@ -123,6 +130,9 @@ enum SearchEngine {
         }
     }
 
+    /// What one item of the walk leaves it to do, carried out of that item's autorelease pool.
+    private enum WalkStep { case next, rootDone, stop }
+
     /// Synchronous on purpose: `NSEnumerator` cannot be iterated from an async context in Swift 6.
     /// `isStopped` is checked between items and before each file a content search reads, so Stop
     /// takes effect even in the middle of a batch.
@@ -182,7 +192,7 @@ enum SearchEngine {
                 if snippet == nil, options.searchContents,
                    let text = contentText(
                        of: hit.url, size: hit.size, maxBytes: limits.maxContentBytes,
-                       recognizeText: options.recognizeText)
+                       recognizeText: options.recognizeText, isStopped: isStopped)
                 {
                     snippet = request.textMatcher.snippet(in: text)
                 }
@@ -259,9 +269,7 @@ enum SearchEngine {
             // The enumerator does not follow a root that is itself a symlink — a ~/Documents linked
             // to another disk would list nothing — so the link is resolved first.
             let root = root.resolvingSymlinksInPath()
-            // The canonical path, not `resolvingSymlinksInPath()`: that strips `/private`, while the
-            // enumerator yields `/private/var/...` for a root under `/var`.
-            let rootPath = (try? root.resourceValues(forKeys: [.canonicalPathKey]).canonicalPath) ?? root.path
+            let rootPath = walkedPath(of: root)
             guard let enumerator = FileManager.default.enumerator(
                 at: root,
                 includingPropertiesForKeys: Array(resourceKeys),
@@ -272,75 +280,93 @@ enum SearchEngine {
                 })
             else { continue }
 
-            while let url = enumerator.nextObject() as? URL {
-                if isStopped() { return }
-                scanned += 1
-                guard let values = try? url.resourceValues(forKeys: resourceKeys) else { continue }
-                let isDirectory = values.isDirectory ?? false
-                if isDirectory && (shouldSkipDirectory(url, rootPath: rootPath, options: options)
-                    || limits.skippedFolderNames.contains(url.lastPathComponent.lowercased()))
-                {
-                    enumerator.skipDescendants()
-                    continue
-                }
-                if !options.includeApplications && isDirectory
-                    && url.pathExtension.caseInsensitiveCompare("app") == .orderedSame
-                {
-                    enumerator.skipDescendants()
-                    continue
-                }
-
-                let isFolder = isDirectory && !(values.isPackage ?? false)
-                let isRegularFile = values.isRegularFile ?? false
-                func makeHit() -> FileHit {
-                    FileHit(
-                        url: url,
-                        name: url.lastPathComponent,
-                        isFolder: isFolder,
-                        size: isRegularFile ? Int64(values.fileSize ?? 0) : -1,
-                        modified: values.contentModificationDate ?? .distantPast,
-                        created: values.creationDate ?? .distantPast,
-                        kind: kind(for: url, isFolder: isFolder))
-                }
-
-                let isWantedKind = switch options.kind {
-                case .filesAndFolders: true
-                case .files: !isFolder
-                case .folders: isFolder
-                }
-                let ext = url.pathExtension.lowercased()
-                let isWanted = isWantedKind && passesFilters(
-                    ext: ext, isFolder: isFolder, size: isRegularFile ? Int64(values.fileSize ?? 0) : -1,
-                    modified: values.contentModificationDate ?? .distantPast)
-                if isWanted {
-                    // Cheapest fields first; contents are read later, in parallel, only for items
-                    // nothing else matched.
-                    if (options.searchNames && request.nameMatcher.matches(url.lastPathComponent))
-                        || (options.searchTags && (values.tagNames ?? []).contains(where: request.nameMatcher.matches))
-                        || (options.searchComments && finderComment(of: url).map(request.textMatcher.matches) == true)
+            // A pool per item: the walk is one long block on one thread, and the enumerator and the
+            // resource-value reads autorelease as they go, so without one every item's temporaries
+            // lived until the walk ended: 163 MB at the peak across /System/Library's 258,000
+            // items, 45 MB with the pool.
+            while true {
+                let step: WalkStep = autoreleasepool {
+                    guard let url = enumerator.nextObject() as? URL else { return .rootDone }
+                    if isStopped() { return .stop }
+                    scanned += 1
+                    guard let values = try? url.resourceValues(forKeys: resourceKeys) else { return .next }
+                    let isDirectory = values.isDirectory ?? false
+                    if isDirectory && (shouldSkipDirectory(url, rootPath: rootPath, options: options)
+                        || limits.skippedFolderNames.contains(url.lastPathComponent.lowercased()))
                     {
-                        pending.append(makeHit())
-                    } else if options.readsInsideFiles && isRegularFile {
-                        candidates.append(makeHit())
-                        if candidates.count >= 64 { searchCandidateContents() }
+                        enumerator.skipDescendants()
+                        return .next
                     }
+                    if !options.includeApplications && isDirectory
+                        && url.pathExtension.caseInsensitiveCompare("app") == .orderedSame
+                    {
+                        enumerator.skipDescendants()
+                        return .next
+                    }
+
+                    let isFolder = isDirectory && !(values.isPackage ?? false)
+                    let isRegularFile = values.isRegularFile ?? false
+                    func makeHit() -> FileHit {
+                        FileHit(
+                            url: url,
+                            name: url.lastPathComponent,
+                            isFolder: isFolder,
+                            size: isRegularFile ? Int64(values.fileSize ?? 0) : -1,
+                            modified: values.contentModificationDate ?? .distantPast,
+                            created: values.creationDate ?? .distantPast,
+                            kind: kind(for: url, isFolder: isFolder))
+                    }
+
+                    let isWantedKind = switch options.kind {
+                    case .filesAndFolders: true
+                    case .files: !isFolder
+                    case .folders: isFolder
+                    }
+                    let ext = url.pathExtension.lowercased()
+                    let isWanted = isWantedKind && passesFilters(
+                        ext: ext, isFolder: isFolder, size: isRegularFile ? Int64(values.fileSize ?? 0) : -1,
+                        modified: values.contentModificationDate ?? .distantPast)
+                    if isWanted {
+                        // Cheapest fields first; contents are read later, in parallel, only for items
+                        // nothing else matched.
+                        if (options.searchNames && request.nameMatcher.matches(url.lastPathComponent))
+                            || (options.searchTags && (values.tagNames ?? []).contains(where: request.nameMatcher.matches))
+                            || (options.searchComments && finderComment(of: url).map(request.textMatcher.matches) == true)
+                        {
+                            pending.append(makeHit())
+                        } else if options.readsInsideFiles && isRegularFile {
+                            candidates.append(makeHit())
+                            if candidates.count >= 64 { searchCandidateContents() }
+                        }
+                    }
+                    if options.includeArchiveContents, options.searchNames, isRegularFile, ext == "zip",
+                       !isPlaceholder(url)
+                    {
+                        searchArchive(at: url, modified: values.contentModificationDate ?? .distantPast,
+                                      created: values.creationDate ?? .distantPast)
+                    }
+                    flush(current: url.path)
+                    if reachedLimit {
+                        emit(.limitReached)
+                        return .stop
+                    }
+                    return .next
                 }
-                if options.includeArchiveContents, options.searchNames, isRegularFile, ext == "zip",
-                   !isPlaceholder(url)
-                {
-                    searchArchive(at: url, modified: values.contentModificationDate ?? .distantPast,
-                                  created: values.creationDate ?? .distantPast)
-                }
-                flush(current: url.path)
-                if reachedLimit {
-                    emit(.limitReached)
-                    return
-                }
+                if step == .stop { return }
+                if step == .rootDone { break }
             }
             searchCandidateContents()
         }
         flush(current: "", force: true)
         if reachedLimit { emit(.limitReached) }
+    }
+
+    /// The path the walk reports a root's items under. Through a root that is itself a symlink,
+    /// and canonical rather than `resolvingSymlinksInPath()`: that strips `/private`, while the
+    /// enumerator yields `/private/var/...` for a root under `/var`.
+    static func walkedPath(of root: URL) -> String {
+        let root = root.resolvingSymlinksInPath()
+        return (try? root.resourceValues(forKeys: [.canonicalPathKey]).canonicalPath) ?? root.path
     }
 
     /// Folders pruned before the walk descends into them. `rootPath` is the resolved root being
@@ -416,10 +442,15 @@ enum SearchEngine {
 
     /// Plain text, PDF and word-processor documents. Anything else is sniffed: no NUL bytes in the
     /// first 8 KB means it is treated as text, which catches source files with unknown extensions.
+    ///
+    /// `isStopped` is checked between the steps of a long extraction — OCR page by page, an
+    /// archive chunk by chunk. The walk passes its own: it runs on plain threads, where
+    /// `Task.isCancelled` is always false.
     static func contentText(
-        of url: URL, size: Int64, maxBytes: Int = SearchLimits().maxContentBytes, recognizeText: Bool = false
+        of url: URL, size: Int64, maxBytes: Int = SearchLimits().maxContentBytes, recognizeText: Bool = false,
+        isStopped: () -> Bool = { Task.isCancelled }
     ) -> String? {
-        guard size > 0, size <= maxBytes, !Task.isCancelled else { return nil }
+        guard size > 0, size <= maxBytes, !isStopped() else { return nil }
         // An iCloud file that is not downloaded is a placeholder, and reading it downloads it — a
         // content search of iCloud Drive would otherwise pull the whole drive down.
         if isPlaceholder(url) { return nil }
@@ -430,40 +461,53 @@ enum SearchEngine {
             let text = document.string ?? ""
             // Next to no text across the pages means a scan: pictures of pages, not text.
             if recognizeText, text.trimmingCharacters(in: .whitespacesAndNewlines).count < 20 * max(document.pageCount, 1) / 10 {
-                return DocumentText.recognizedText(inScannedPDF: document)
+                return DocumentText.recognizedText(inScannedPDF: document, isStopped: isStopped)
             }
             return text
         }
         // SVG is an image written as text: its words are read directly, where OCR would find none.
         if recognizeText, let type, type.conforms(to: .image), !type.conforms(to: .text) {
-            return DocumentText.recognizedText(inImageAt: url)
+            return DocumentText.recognizedText(inImageAt: url, isStopped: isStopped)
         }
         if let type, richTextTypes.contains(where: type.conforms(to:)) {
             return try? NSAttributedString(url: url, options: [:], documentAttributes: nil).string
         }
         if let members = DocumentText.zipMembers(forExtension: url.pathExtension.lowercased()) {
-            return DocumentText.zipText(of: url, members: members, maxBytes: maxBytes)
+            return DocumentText.zipText(of: url, members: members, maxBytes: maxBytes, isStopped: isStopped)
         }
         let isText = type?.conforms(to: .text) ?? false
         let isUnknown = type == nil || type?.isDynamic == true
         guard isText || isUnknown else { return nil }
         // A plain read: decoding copies the bytes anyway, and a mapped file whose volume goes
-        // away mid-read takes the process down with SIGBUS.
-        guard let data = try? Data(contentsOf: url), let text = decode(data) else { return nil }
+        // away mid-read takes the process down with SIGBUS. The first 8 KB alone decides a file is
+        // binary, so only that much is read to turn one down, not the whole file.
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let head = try? handle.read(upToCount: 8192), !isBinary(head),
+              (try? handle.seek(toOffset: 0)) != nil,
+              let data = try? handle.readToEnd(), let text = decode(data)
+        else { return nil }
         // Web pages are searched for what they say, not for their tags and scripts.
         if let type, type.conforms(to: .html) { return DocumentText.markupText(text) }
         return text
     }
 
     static func decode(_ data: Data) -> String? {
-        if data.starts(with: [0xFF, 0xFE]) || data.starts(with: [0xFE, 0xFF]) {
-            return String(data: data, encoding: .utf16)
-        }
-        if data.prefix(8192).contains(0) { return nil }
+        if hasUTF16Mark(data) { return String(data: data, encoding: .utf16) }
+        if isBinary(data) { return nil }
         // Latin-1 last: it accepts every byte, including the five Windows-1252 leaves undefined
         // (0x81, 0x8D, 0x8F, 0x90, 0x9D), which Mac Roman text uses for letters.
         return String(data: data, encoding: .utf8) ?? String(data: data, encoding: .windowsCP1252)
             ?? String(data: data, encoding: .isoLatin1)
+    }
+
+    /// A NUL byte in the first 8 KB, with no UTF-16 byte order mark to account for it.
+    static func isBinary(_ data: Data) -> Bool {
+        !hasUTF16Mark(data) && data.prefix(8192).contains(0)
+    }
+
+    private static func hasUTF16Mark(_ data: Data) -> Bool {
+        data.starts(with: [0xFF, 0xFE]) || data.starts(with: [0xFE, 0xFF])
     }
 }
 
@@ -496,27 +540,44 @@ enum DuplicateFinder {
         let size: Int64
     }
 
-    static func sets(in candidates: [Candidate]) -> [[FileHit.ID]] {
+    struct Found: Sendable {
+        /// Largest set first.
+        var sets: [[FileHit.ID]] = []
+        /// Files that had a same-size partner but could not be read, so were never compared: iCloud
+        /// placeholders, unreadable files, and files changed since the search.
+        var unread = 0
+    }
+
+    static func sets(in candidates: [Candidate]) -> Found {
         let headLength = 64 * 1024
         // Checked per file: hashing a big library takes minutes, and whoever asked may have moved on.
         // A cancelled file hashes to nil, so it joins no set; the partial result is discarded.
         func digest(of candidate: Candidate, limit: Int?) -> String? {
             Task.isCancelled ? nil : Self.digest(of: candidate.url, limit: limit, size: candidate.size)
         }
-        var sets: [[FileHit.ID]] = []
+        var found = Found()
         for sameSize in Dictionary(grouping: candidates, by: \.size).values where sameSize.count > 1 {
-            if Task.isCancelled { return [] }
-            for (head, sameHead) in Dictionary(grouping: sameSize, by: { digest(of: $0, limit: headLength) })
-            where head != nil && sameHead.count > 1 {
+            if Task.isCancelled { return Found() }
+            for (head, sameHead) in Dictionary(grouping: sameSize, by: { digest(of: $0, limit: headLength) }) {
+                guard head != nil else {
+                    found.unread += sameHead.count
+                    continue
+                }
+                guard sameHead.count > 1 else { continue }
                 let identical = sameSize[0].size <= Int64(headLength)
                     ? [head: sameHead]
                     : Dictionary(grouping: sameHead, by: { digest(of: $0, limit: nil) })
-                for (whole, set) in identical where whole != nil && set.count > 1 {
-                    sets.append(set.map(\.id))
+                for (whole, set) in identical {
+                    if whole == nil {
+                        found.unread += set.count
+                    } else if set.count > 1 {
+                        found.sets.append(set.map(\.id))
+                    }
                 }
             }
         }
-        return sets.sorted { $0.count > $1.count }
+        found.sets.sort { $0.count > $1.count }
+        return found
     }
 
     /// SHA-256 of the first `limit` bytes, or of everything. Nil for a file that cannot be read
