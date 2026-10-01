@@ -194,7 +194,7 @@ struct SearchHeader: View {
                     // A dark tint on the glass, so the field sits a shade deeper than the window.
                     .glassEffect(.regular.tint(.black.opacity(0.3)).interactive(), in: .capsule)
 
-                    if model.isSearching {
+                    if model.isSearching || model.isFindingDuplicates {
                         Button(role: .cancel) { model.stop() } label: {
                             Label("Stop", systemImage: "stop.fill").padding(.horizontal, 4)
                         }
@@ -222,7 +222,7 @@ struct SearchHeader: View {
         .padding(.horizontal, 14)
         .padding(.top, 24)
         .padding(.bottom, 10)
-        .animation(.smooth(duration: 0.3), value: model.isSearching)
+        .animation(.smooth(duration: 0.3), value: model.isSearching || model.isFindingDuplicates)
         .animation(.spring(duration: 0.4, bounce: 0.15), value: model.showsSidebar)
         .onChange(of: model.focusRequest) { fieldFocused = true }
         .onChange(of: fieldFocused) { model.isEditingQuery = fieldFocused }
@@ -719,6 +719,7 @@ struct ResultMenu: View {
                 if !applications.isEmpty { Divider() }
                 Button("Other…") { model.chooseApplicationAndOpen(ids) }
             }
+            .disabled(model.openableURLs(ids).isEmpty)
             Button("Show in Finder") { model.reveal(ids) }
             Button("Quick Look") {
                 model.previewURL = model.targets(ids).first

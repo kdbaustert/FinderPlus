@@ -238,6 +238,9 @@ final class SearchModel {
     struct PreviewContext: Sendable {
         let matcher: QueryMatcher
         let recognizeText: Bool
+        /// The search read metadata, so a file without a match in its body may have been found
+        /// by that instead.
+        let searchedMetadata: Bool
     }
     /// Duplicates view: each result's set number. Empty when showing ordinary results.
     private(set) var duplicateSets: [FileHit.ID: Int] = [:]
@@ -337,7 +340,9 @@ final class SearchModel {
                 guard !Task.isCancelled, let self else { return }
                 self.leaveDuplicates(restoring: false)
                 self.previewContext = options.readsInsideFiles
-                    ? PreviewContext(matcher: request.textMatcher, recognizeText: options.searchContents && options.recognizeText)
+                    ? PreviewContext(
+                        matcher: request.textMatcher, recognizeText: options.searchContents && options.recognizeText,
+                        searchedMetadata: options.searchMetadata)
                     : nil
                 refine = self.refinable(for: request)
             }
@@ -907,6 +912,9 @@ final class SearchModel {
     }
 
     nonisolated static func csvField(_ value: String) -> String {
+        // A spreadsheet runs a cell starting with one of these as a formula, so a file named
+        // "=HYPERLINK(…)" would run when the export is opened. The apostrophe makes it text.
+        if let first = value.first, "=+-@\t\r".contains(first) { return csvField("'" + value) }
         guard value.contains(where: { ",\"\n\r".contains($0) }) else { return value }
         return "\"" + value.replacingOccurrences(of: "\"", with: "\"\"") + "\""
     }
@@ -944,14 +952,21 @@ final class SearchModel {
 
     // MARK: - Open With, Copy To, Move To
 
+    /// The rows' own files, each once. Archive entries are left out, as Open does: handed their
+    /// zip, the first app offered is Archive Utility, which extracts all of it.
+    func openableURLs(_ ids: Set<FileHit.ID>?) -> [URL] {
+        var seen = Set<URL>()
+        return hits(ids).filter { !$0.isArchiveEntry }.map(\.url).filter { seen.insert($0).inserted }
+    }
+
     /// Apps that can open the first of the rows, the default one first.
     func applications(toOpen ids: Set<FileHit.ID>?) -> [URL] {
-        guard let first = targets(ids).first else { return [] }
+        guard let first = openableURLs(ids).first else { return [] }
         return NSWorkspace.shared.urlsForApplications(toOpen: first)
     }
 
     func open(_ ids: Set<FileHit.ID>?, with application: URL) {
-        let urls = targets(ids)
+        let urls = openableURLs(ids)
         guard !urls.isEmpty else { return }
         NSWorkspace.shared.open(urls, withApplicationAt: application, configuration: NSWorkspace.OpenConfiguration())
     }
@@ -1017,12 +1032,19 @@ final class SearchModel {
 
     nonisolated static func perform(_ kind: Transfer, _ sources: [URL], into folder: URL) -> TransferOutcome {
         var outcome = TransferOutcome()
+        let destination = folder.resolvingSymlinksInPath().path
         for source in sources {
+            // A folder copied into itself keeps finding the copy it is writing and copies that
+            // too, about a hundred levels deep, until the path is too long — and the partial
+            // copies stay behind. Finder refuses it, and so does this.
+            let resolved = source.resolvingSymlinksInPath().path
+            if destination == resolved || destination.hasPrefix(resolved + "/") {
+                outcome.failed.append("\(source.lastPathComponent): A folder can’t be \(kind == .copy ? "copied" : "moved") into itself.")
+                continue
+            }
             // Moved to where it already is, a file stays put: `availableName` would count the file
             // itself as taken and rename it "Report 2.pdf".
-            if kind == .move,
-               source.deletingLastPathComponent().resolvingSymlinksInPath().path == folder.resolvingSymlinksInPath().path
-            {
+            if kind == .move, source.deletingLastPathComponent().resolvingSymlinksInPath().path == destination {
                 outcome.done[source] = source
                 continue
             }
@@ -1104,6 +1126,9 @@ final class SearchModel {
         let newIDs = Dictionary(zip(before.map(\.id), results.map(\.id))) { first, _ in first }
         selection = Set(selection.map { newIDs[$0] ?? $0 })
         knownIDs = Set(results.map(\.id))
+        // A kept row the user just renamed or moved is current: a Find again walk that already
+        // passed its new place won't report it, and must not drop it for that.
+        for (old, new) in newIDs where old != new { unconfirmed.remove(old) }
         resultsBeforeDuplicates = resultsBeforeDuplicates.map { Self.relocate($0, renamed) }
         if showsDuplicates {
             // Relocated rows keep their set number, and the rows stay grouped the way Find
@@ -1253,7 +1278,7 @@ final class SearchModel {
     /// Narrows the results to files whose contents match another result's, grouped into sets.
     func findDuplicates() {
         guard !isSearching, !isFindingDuplicates else { return }
-        let base = resultsBeforeDuplicates ?? results
+        let base = resultsOutsideDuplicates
         let candidates = base.filter { !$0.isFolder && !$0.isArchiveEntry && $0.size > 0 }
             .map { DuplicateFinder.Candidate(id: $0.id, url: $0.url, size: $0.size) }
         guard candidates.count > 1 else {
@@ -1268,9 +1293,9 @@ final class SearchModel {
             isFindingDuplicates = false
             // The rows as they are now, not as they were when hashing began: a file renamed, moved
             // or trashed meanwhile keeps that change. One renamed or moved has a new ID and leaves
-            // its set, and a set down to a single file is no set.
-            if resultsBeforeDuplicates != nil { leaveDuplicates() }
-            let current = results
+            // its set, and a set down to a single file is no set. Run again from the duplicates
+            // view, a search that finds none leaves that view up rather than restoring the full list.
+            let current = resultsOutsideDuplicates
             let present = Set(current.map(\.id))
             let sets = found.sets.map { $0.filter(present.contains) }.filter { $0.count > 1 }
             guard !sets.isEmpty else {
@@ -1299,19 +1324,24 @@ final class SearchModel {
     func leaveDuplicates(restoring: Bool = true) {
         duplicateTask?.cancel()
         isFindingDuplicates = false
-        guard let before = resultsBeforeDuplicates else { return }
+        guard resultsBeforeDuplicates != nil else { return }
         if restoring {
-            // Rows trashed or moved while viewing duplicates stay gone; moved ones come back at
-            // their new location.
-            let shown = Set(results.map(\.id))
-            let removed = Set(duplicateSets.keys).subtracting(shown)
-            let beforeIDs = Set(before.map(\.id))
-            results = before.filter { !removed.contains($0.id) } + results.filter { !beforeIDs.contains($0.id) }
+            results = resultsOutsideDuplicates
             knownIDs = Set(results.map(\.id))
             resort()
         }
         resultsBeforeDuplicates = nil
         duplicateSets = [:]
+    }
+
+    /// The full results as leaving the duplicates view would restore them, unsorted. Rows trashed
+    /// or moved while viewing duplicates stay gone; moved ones come back at their new location.
+    private var resultsOutsideDuplicates: [FileHit] {
+        guard let before = resultsBeforeDuplicates else { return results }
+        let shown = Set(results.map(\.id))
+        let removed = Set(duplicateSets.keys).subtracting(shown)
+        let beforeIDs = Set(before.map(\.id))
+        return before.filter { !removed.contains($0.id) } + results.filter { !beforeIDs.contains($0.id) }
     }
 
     // MARK: - Full Disk Access

@@ -52,14 +52,52 @@ enum DocumentText {
     static func markupText(_ markup: String) -> String {
         var text = markup.replacing(/<(script|style)\b[\s\S]*?<\/\1>/.ignoresCase(), with: " ")
         text = text.replacing(/<[^>]*>/, with: " ")
-        for (entity, character) in [
-            ("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&apos;", "'"), ("&#39;", "'"), ("&nbsp;", " "),
-            ("&amp;", "&"),
-        ] {
-            text = text.replacingOccurrences(of: entity, with: character)
+        // One pass, so "&amp;lt;" decodes to "&lt;" and no further. An unknown name is left as
+        // written.
+        text = text.replacing(/&(#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});/) { match in
+            let body = match.output.1
+            let scalar: Unicode.Scalar? = if body.hasPrefix("#x") || body.hasPrefix("#X") {
+                UInt32(body.dropFirst(2), radix: 16).flatMap(Unicode.Scalar.init)
+            } else if body.hasPrefix("#") {
+                UInt32(body.dropFirst()).flatMap(Unicode.Scalar.init)
+            } else {
+                namedEntities[String(body)]
+            }
+            guard let scalar, scalar != "\0" else { return String(match.output.0) }
+            return String(Character(scalar))
         }
         return text.replacing(/\s+/, with: " ")
     }
+
+    /// HTML's named characters for Latin-1 and typography, the ones text actually uses. Greek
+    /// letters and maths symbols are left out. A non-breaking space reads as a plain one, so
+    /// "a&nbsp;b" matches "a b".
+    private static let namedEntities: [String: Unicode.Scalar] = {
+        var table: [String: Unicode.Scalar] = [
+            "quot": "\"", "amp": "&", "apos": "'", "lt": "<", "gt": ">", "nbsp": " ",
+            "OElig": "\u{152}", "oelig": "\u{153}", "Scaron": "\u{160}", "scaron": "\u{161}", "Yuml": "\u{178}",
+            "fnof": "\u{192}", "circ": "\u{2C6}", "tilde": "\u{2DC}", "ensp": "\u{2002}", "emsp": "\u{2003}",
+            "thinsp": "\u{2009}", "zwnj": "\u{200C}", "zwj": "\u{200D}", "ndash": "\u{2013}", "mdash": "\u{2014}",
+            "lsquo": "\u{2018}", "rsquo": "\u{2019}", "sbquo": "\u{201A}", "ldquo": "\u{201C}", "rdquo": "\u{201D}",
+            "bdquo": "\u{201E}", "dagger": "\u{2020}", "Dagger": "\u{2021}", "bull": "\u{2022}",
+            "hellip": "\u{2026}", "permil": "\u{2030}", "prime": "\u{2032}", "Prime": "\u{2033}",
+            "lsaquo": "\u{2039}", "rsaquo": "\u{203A}", "euro": "\u{20AC}", "trade": "\u{2122}",
+        ]
+        // U+00A1 to U+00FF, in code point order.
+        let latin1 = """
+            iexcl cent pound curren yen brvbar sect uml copy ordf laquo not shy reg macr deg plusmn \
+            sup2 sup3 acute micro para middot cedil sup1 ordm raquo frac14 frac12 frac34 iquest \
+            Agrave Aacute Acirc Atilde Auml Aring AElig Ccedil Egrave Eacute Ecirc Euml Igrave Iacute \
+            Icirc Iuml ETH Ntilde Ograve Oacute Ocirc Otilde Ouml times Oslash Ugrave Uacute Ucirc \
+            Uuml Yacute THORN szlig agrave aacute acirc atilde auml aring aelig ccedil egrave eacute \
+            ecirc euml igrave iacute icirc iuml eth ntilde ograve oacute ocirc otilde ouml divide \
+            oslash ugrave uacute ucirc uuml yacute thorn yuml
+            """
+        for (offset, name) in latin1.split(separator: " ").enumerated() {
+            table[String(name)] = Unicode.Scalar(0xA1 + UInt32(offset))
+        }
+        return table
+    }()
 
     // MARK: - Text recognition
 

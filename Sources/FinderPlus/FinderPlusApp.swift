@@ -195,7 +195,8 @@ struct SearchCommands: Commands {
                     .keyboardShortcut(.delete)
                     // ⌘⌫ in the search field deletes to the start of the line; menu shortcuts are
                     // matched first, so without this it would trash the selected results instead.
-                    .disabled(model.selection.isEmpty || model.isEditingQuery)
+                    // The same goes for the Rename sheet's fields, whose files are the selection.
+                    .disabled(model.selection.isEmpty || model.isEditingQuery || model.renameRequest != nil)
             }
         }
         CommandGroup(replacing: .sidebar) {
@@ -216,7 +217,7 @@ struct SearchCommands: Commands {
                     .keyboardShortcut(.return)
                 Button("Stop Search") { model.stop() }
                     .keyboardShortcut(".")
-                    .disabled(!model.isSearching)
+                    .disabled(!model.isSearching && !model.isFindingDuplicates)
                 Divider()
                 Button("Find Duplicates in Results") { model.findDuplicates() }
                     .keyboardShortcut("d", modifiers: [.command, .shift])

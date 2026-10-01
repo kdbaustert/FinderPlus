@@ -619,6 +619,77 @@ final class AuditFixTests: XCTestCase {
                        ["Reports"])
     }
 
+    // `bsdtar` writes "./docs/report.txt", and the "." part read as a hidden folder.
+    func testZipEntriesUnderADotPrefixAreNotHidden() throws {
+        _ = try write("docs/invoice-april.txt")
+        let tar = Process()
+        tar.executableURL = URL(filePath: "/usr/bin/tar")
+        tar.currentDirectoryURL = root
+        tar.arguments = ["-a", "-cf", "dotted.zip", "./docs"]
+        try tar.run()
+        tar.waitUntilExit()
+        XCTAssertEqual(tar.terminationStatus, 0)
+        try FileManager.default.removeItem(at: root.appending(path: "docs"))
+        XCTAssertTrue(SearchEngine.zipEntries(of: root.appending(path: "dotted.zip")).contains("./docs/invoice-april.txt"))
+
+        XCTAssertEqual(try walk("invoice") { $0.includeArchiveContents = true }.map(\.name), ["invoice-april.txt"])
+    }
+
+    // A folder copied into itself kept copying its own copy, about a hundred levels deep.
+    func testAFolderIsNeverCopiedOrMovedIntoItself() throws {
+        _ = try write("Projects/inner/plan.txt")
+        let folder = root.appending(path: "Projects")
+        for destination in [folder, folder.appending(path: "inner")] {
+            for kind in [SearchModel.Transfer.copy, .move] {
+                let outcome = SearchModel.perform(kind, [folder], into: destination)
+                XCTAssertEqual(outcome.done, [:])
+                XCTAssertEqual(outcome.failed.count, 1)
+                XCTAssertTrue(outcome.failed[0].contains("into itself"), outcome.failed[0])
+            }
+        }
+        XCTAssertEqual(
+            try FileManager.default.subpathsOfDirectory(atPath: folder.path).sorted(), ["inner", "inner/plan.txt"])
+        // A sibling whose name only starts the same is not inside it.
+        let sibling = root.appending(path: "Projects-old")
+        try FileManager.default.createDirectory(at: sibling, withIntermediateDirectories: true)
+        XCTAssertEqual(SearchModel.perform(.copy, [folder], into: sibling).failed, [])
+    }
+
+    // macOS files `.ts` as video and `.plist`, `.eml` and `.pem` as types that are not text, so
+    // content search turned them away unread.
+    func testContentSearchReadsTextWhateverItsDeclaredType() throws {
+        for name in ["index.ts", "agent.plist", "mail.eml", "key.pem", "notes.txt"] {
+            _ = try write(name, "the needleagent is here")
+        }
+        let video = root.appending(path: "clip.ts")
+        try Data([0x47, 0x40, 0x00, 0x10] + Array("needleagent".utf8)).write(to: video)
+        XCTAssertEqual(
+            try walk("needleagent") { $0.searchNames = false; $0.searchContents = true }.map(\.name),
+            ["agent.plist", "index.ts", "key.pem", "mail.eml", "notes.txt"])
+    }
+
+    // One invalid byte failed the strict UTF-8 decode, and Windows-1252 turned every "é" into "Ã©".
+    func testOneBadByteKeepsAFileUTF8() throws {
+        let flawed = SearchEngine.decode(Data("café crème brûlée ".utf8) + [0xFF] + Data(" fin".utf8))
+        XCTAssertEqual(flawed, "café crème brûlée \u{FFFD} fin")
+        // A real Windows-1252 file still reads as one.
+        XCTAssertEqual(SearchEngine.decode(Data([0x63, 0x61, 0x66, 0xE9, 0x20, 0x92, 0x73])), "café ’s")
+    }
+
+    func testMarkupDecodesNumericAndNamedEntities() {
+        XCTAssertEqual(
+            DocumentText.markupText("<p>caf&eacute; &#233;t&#xE9; don&rsquo;t &amp;lt; &bogus; &yuml;&iexcl;</p>"),
+            " café été don’t &lt; &bogus; ÿ¡ ")
+    }
+
+    func testCSVExportNeutralisesFormulas() {
+        XCTAssertEqual(SearchModel.csvField("=HYPERLINK(\"x\")"), "\"'=HYPERLINK(\"\"x\"\")\"")
+        XCTAssertEqual(SearchModel.csvField("+1"), "'+1")
+        XCTAssertEqual(SearchModel.csvField("@sum"), "'@sum")
+        XCTAssertEqual(SearchModel.csvField("-draft, v2"), "\"'-draft, v2\"")
+        XCTAssertEqual(SearchModel.csvField("report.pdf"), "report.pdf")
+    }
+
     // `zipinfo` printed non-ASCII entry names in a lossy form, so "Straße.txt" in an archive could
     // never be found by name. Neither name decomposes, so filesystem normalization cannot blur it.
     func testZipEntryNamesKeepTheirNonASCIICharacters() throws {
@@ -1124,6 +1195,31 @@ final class ResultActionTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(300))
         XCTAssertFalse(model.isFindingDuplicates)
         XCTAssertFalse(model.showsDuplicates, "a stopped hash must not bring up the duplicates view")
+        XCTAssertEqual(model.results.count, 2)
+    }
+
+    // Run again from the duplicates view, a search that found none restored the full list.
+    func testFindingNoDuplicatesAgainKeepsTheDuplicatesView() async throws {
+        _ = try write("a/photo.jpg", "same bytes")
+        let copy = try write("b/photo copy.jpg", "same bytes")
+        _ = try write("c/other.png", "x")
+        let model = SearchModel(defaults: defaults)
+        model.locationID = root.path
+        model.query = "photo"
+        model.start()
+        try await finish(model)
+        model.findDuplicates()
+        try await finish(model)
+        XCTAssertEqual(model.results.count, 2)
+
+        try "diff bytes".write(to: copy, atomically: true, encoding: .utf8)
+        // The "No duplicates" alert is modal; the test host has no window to show it in, so it
+        // returns at once.
+        model.findDuplicates()
+        try await finish(model)
+        XCTAssertTrue(model.showsDuplicates)
+        XCTAssertEqual(model.results.count, 2)
+        model.leaveDuplicates()
         XCTAssertEqual(model.results.count, 2)
     }
 

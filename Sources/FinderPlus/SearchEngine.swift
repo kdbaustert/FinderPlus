@@ -224,7 +224,10 @@ enum SearchEngine {
                 // Finder's resource-fork shadows, not files anyone put in the archive.
                 guard !name.isEmpty, !path.hasPrefix("__MACOSX"), !name.hasPrefix("._") else { continue }
                 // Every component, as the walk prunes whole folders: "proj/.git/HEAD" is hidden too.
-                let components = path.split(separator: "/")
+                // Less the "." parts some tools write: `bsdtar` stores "./docs/report.txt", and the
+                // "." is not a hidden name. The "./" entry for the archive's top is no entry at all.
+                let components = path.split(separator: "/").filter { $0 != "." }
+                guard !components.isEmpty else { continue }
                 if !options.includeHidden, components.contains(where: { $0.hasPrefix(".") }) { continue }
                 if components.dropLast(isEntryFolder ? 0 : 1)
                     .contains(where: { limits.skippedFolderNames.contains($0.lowercased()) })
@@ -475,9 +478,10 @@ enum SearchEngine {
         if let members = DocumentText.zipMembers(forExtension: url.pathExtension.lowercased()) {
             return DocumentText.zipText(of: url, members: members, maxBytes: maxBytes, isStopped: isStopped)
         }
-        let isText = type?.conforms(to: .text) ?? false
-        let isUnknown = type == nil || type?.isDynamic == true
-        guard isText || isUnknown else { return nil }
+        // Every other file is sniffed, whatever its declared type: macOS files `.ts` as an MPEG-2
+        // video stream, and `.plist`, `.eml` and `.pem` as types that are not text, though each is
+        // usually plain text. A real video or binary plist has a NUL within its first 8 KB.
+        //
         // A plain read: decoding copies the bytes anyway, and a mapped file whose volume goes
         // away mid-read takes the process down with SIGBUS. The first 8 KB alone decides a file is
         // binary, so only that much is read to turn one down, not the whole file.
@@ -497,8 +501,18 @@ enum SearchEngine {
         if isBinary(data) { return nil }
         // Latin-1 last: it accepts every byte, including the five Windows-1252 leaves undefined
         // (0x81, 0x8D, 0x8F, 0x90, 0x9D), which Mac Roman text uses for letters.
-        return String(data: data, encoding: .utf8) ?? String(data: data, encoding: .windowsCP1252)
-            ?? String(data: data, encoding: .isoLatin1)
+        if let text = String(data: data, encoding: .utf8) { return text }
+        // One stray byte fails the strict decode, and Windows-1252 would then turn every "é" in
+        // an otherwise UTF-8 file into "Ã©". Valid multi-byte sequences outnumbering the bad
+        // ones say UTF-8 with a flaw; a Windows-1252 file's accented letters, single high bytes,
+        // almost never form one.
+        let lossy = String(decoding: data, as: UTF8.self)
+        var valid = 0, invalid = 0
+        for scalar in lossy.unicodeScalars where scalar.value >= 0x80 {
+            if scalar == "\u{FFFD}" { invalid += 1 } else { valid += 1 }
+        }
+        if valid > invalid { return lossy }
+        return String(data: data, encoding: .windowsCP1252) ?? String(data: data, encoding: .isoLatin1)
     }
 
     /// A NUL byte in the first 8 KB, with no UTF-16 byte order mark to account for it.

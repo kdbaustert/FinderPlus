@@ -194,6 +194,7 @@ jobs:
           TAG: ${{ steps.version.outputs.tag }}
           VERSION: ${{ steps.version.outputs.version }}
           BETA: ${{ steps.version.outputs.beta }}
+          SIGNED: ${{ steps.codesign.outputs.identity != '' }}
           EXISTS: ${{ steps.existing.outputs.exists }}
           REUSE: ${{ steps.existing.outputs.reuse }}
         run: |
@@ -213,7 +214,13 @@ jobs:
           if [[ "$BETA" == "1" ]]; then
             PRERELEASE=(--prerelease --latest=false)
           fi
-          NOTES=$'This build is ad-hoc signed, not notarised — there is no Apple Developer Program\nmembership behind it yet. macOS Gatekeeper will call the download damaged or from an\nunidentified developer on first launch. To open it: right-click FinderPlus.app → Open, or run\n`xattr -cr /path/to/FinderPlus.app` in Terminal.\n\n'
+          # Self-signed with the release certificate when the secrets hold it, ad-hoc otherwise.
+          # Either way Gatekeeper knows no developer behind it.
+          SIGNATURE="ad-hoc signed"
+          if [[ "$SIGNED" == "true" ]]; then
+            SIGNATURE="self-signed"
+          fi
+          NOTES="This build is $SIGNATURE"$', not notarised — there is no Apple Developer Program\nmembership behind it yet. macOS Gatekeeper will call the download damaged or from an\nunidentified developer on first launch. To open it: right-click FinderPlus.app → Open, or run\n`xattr -cr /path/to/FinderPlus.app` in Terminal.\n\n'
           # --generate-notes adds the changes since the last tag after the notice above.
           gh release create "$TAG" "$ASSET" \
             --title "FinderPlus $VERSION" \

@@ -95,7 +95,9 @@ private struct MatchesPreview: View {
                     of: url, size: size, maxBytes: maxBytes, recognizeText: context.recognizeText))
                 if let contents, !contents.ranges.isEmpty { return contents }
                 // A file found by its metadata — owner, permissions — shows that, rather than a body
-                // with nothing marked in it.
+                // with nothing marked in it. Not when metadata wasn't searched: the match is then
+                // in the body, past the part shown.
+                guard context.searchedMetadata else { return contents }
                 let metadata = marked(DocumentText.metadataText(of: url))
                 if let metadata, !metadata.ranges.isEmpty { return metadata }
                 return contents ?? metadata
