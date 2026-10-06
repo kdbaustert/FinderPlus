@@ -120,9 +120,11 @@ struct ContentView: View {
     }
 
     private var subtitle: String {
-        let place = model.location.title
+        // The place the results actually came from: with the Location menu moved on since, the
+        // menu's current choice would claim the wrong folder for the counts on screen.
+        let place = (model.searchedLocation ?? model.location).title
         return switch model.phase {
-        case .idle, .failed: place
+        case .idle, .failed: model.location.title
         case .searching: "Searching \(place)…"
         case .finished, .stopped: "\(model.results.count.formatted()) matches in \(place)"
         }

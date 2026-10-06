@@ -105,17 +105,29 @@ struct SearchRequest: Sendable {
 /// hidden, system and never-indexed files.
 enum SearchEngine {
 
+    /// TypeScript's extensions, which macOS maps to MPEG-2 types: `.ts` a transport stream,
+    /// `.mts` and `.cts` AVCHD. Either meaning can be true of any one file, so these are kept
+    /// out of kind exclusion and shown under a neutral kind.
+    private static let mpeg2SourceExtensions: Set<String> = ["ts", "mts", "cts"]
+
     private static let resourceKeys: Set<URLResourceKey> = [
         .isDirectoryKey, .isPackageKey, .isRegularFileKey, .fileSizeKey, .contentModificationDateKey,
         .creationDateKey,
     ]
 
-    private static let richTextTypes: [UTType] = [
-        .rtf,
-        UTType("org.openxmlformats.wordprocessingml.document"),
-        UTType("com.microsoft.word.doc"),
-        UTType("org.oasis-open.opendocument.text"),
-    ].compactMap { $0 }
+    /// Word-processor types and the reader each is parsed with. The format is passed to
+    /// NSAttributedString rather than sniffed: with no type given, AppKit sends a web app's
+    /// HTML-written ".doc" export to WebKit, which waits a full minute on the page's remote
+    /// images — and one such file froze its whole content batch.
+    private static let richTextTypes: [(type: UTType, format: NSAttributedString.DocumentType)] = {
+        let pairs: [(UTType?, NSAttributedString.DocumentType)] = [
+            (.rtf, .rtf),
+            (UTType("org.openxmlformats.wordprocessingml.document"), .officeOpenXML),
+            (UTType("com.microsoft.word.doc"), .docFormat),
+            (UTType("org.oasis-open.opendocument.text"), .openDocument),
+        ]
+        return pairs.compactMap { type, format in type.map { ($0, format) } }
+    }()
 
     static func run(_ request: SearchRequest) -> AsyncStream<SearchEvent> {
         AsyncStream { continuation in
@@ -192,7 +204,8 @@ enum SearchEngine {
                 if snippet == nil, options.searchContents,
                    let text = contentText(
                        of: hit.url, size: hit.size, maxBytes: limits.maxContentBytes,
-                       recognizeText: options.recognizeText, isStopped: isStopped)
+                       recognizeText: options.recognizeText, isStopped: isStopped,
+                       onUnreadable: { unreadable.withLock { $0 += 1 } })
                 {
                     snippet = request.textMatcher.snippet(in: text)
                 }
@@ -206,6 +219,9 @@ enum SearchEngine {
 
         func isExcludedKind(_ ext: String) -> Bool {
             guard !options.excludedKinds.isEmpty, !ext.isEmpty else { return false }
+            // TypeScript before the type lookup: these extensions declare MPEG-2 video types, and
+            // a "Video" exclusion was hiding source files from name searches too.
+            if mpeg2SourceExtensions.contains(ext) { return false }
             if let cached = excludedExtensions[ext] { return cached }
             let type = UTType(filenameExtension: ext)
             let excluded = type.map { type in options.excludedKinds.contains { type.conforms(to: $0.type) } } ?? false
@@ -262,6 +278,9 @@ enum SearchEngine {
             if isFolder { return "Folder" }
             let ext = url.pathExtension.lowercased()
             if ext.isEmpty { return "Document" }
+            // Neutral for the MPEG-2-declared extensions: "TS File" is true of a TypeScript
+            // module and of a transport stream, where the declared kind is true of only one.
+            if mpeg2SourceExtensions.contains(ext) { return "\(ext.uppercased()) File" }
             if let cached = kinds[ext] { return cached }
             let description = UTType(filenameExtension: ext)?.localizedDescription ?? "\(ext.uppercased()) File"
             kinds[ext] = description
@@ -451,12 +470,18 @@ enum SearchEngine {
     /// `Task.isCancelled` is always false.
     static func contentText(
         of url: URL, size: Int64, maxBytes: Int = SearchLimits().maxContentBytes, recognizeText: Bool = false,
-        isStopped: () -> Bool = { Task.isCancelled }
+        isStopped: () -> Bool = { Task.isCancelled }, onUnreadable: () -> Void = {}
     ) -> String? {
         guard size > 0, size <= maxBytes, !isStopped() else { return nil }
         // An iCloud file that is not downloaded is a placeholder, and reading it downloads it — a
         // content search of iCloud Drive would otherwise pull the whole drive down.
         if isPlaceholder(url) { return nil }
+        // Counted, not skipped in silence: a file the search cannot open must not look like a
+        // file that simply does not contain the words.
+        guard FileManager.default.isReadableFile(atPath: url.path) else {
+            onUnreadable()
+            return nil
+        }
         let type = UTType(filenameExtension: url.pathExtension)
 
         if let type, type.conforms(to: .pdf) {
@@ -472,8 +497,14 @@ enum SearchEngine {
         if recognizeText, let type, type.conforms(to: .image), !type.conforms(to: .text) {
             return DocumentText.recognizedText(inImageAt: url, isStopped: isStopped)
         }
-        if let type, richTextTypes.contains(where: type.conforms(to:)) {
-            return try? NSAttributedString(url: url, options: [:], documentAttributes: nil).string
+        if let type, let format = richTextTypes.first(where: { type.conforms(to: $0.type) })?.format {
+            if let text = try? NSAttributedString(
+                url: url, options: [.documentType: format], documentAttributes: nil).string
+            {
+                return text
+            }
+            // A failed parse falls through to the sniff below: the usual culprit is HTML wearing
+            // a ".doc" extension, which the sniff reads as the text it is.
         }
         if let members = DocumentText.zipMembers(forExtension: url.pathExtension.lowercased()) {
             return DocumentText.zipText(of: url, members: members, maxBytes: maxBytes, isStopped: isStopped)
@@ -491,13 +522,24 @@ enum SearchEngine {
               (try? handle.seek(toOffset: 0)) != nil,
               let data = try? handle.readToEnd(), let text = decode(data)
         else { return nil }
-        // Web pages are searched for what they say, not for their tags and scripts.
-        if let type, type.conforms(to: .html) { return DocumentText.markupText(text) }
+        // Web pages are searched for what they say, not for their tags and scripts. Checked by
+        // content as well as by type, for the HTML that reaches here under a ".doc" name.
+        if (type?.conforms(to: .html) ?? false) || looksLikeHTML(text) {
+            return DocumentText.markupText(text, isStopped: isStopped)
+        }
         return text
     }
 
+    /// HTML by content, for a file whose extension says otherwise.
+    static func looksLikeHTML(_ text: String) -> Bool {
+        let head = text.prefix(256).lowercased()
+        return head.contains("<!doctype html") || head.contains("<html")
+    }
+
     static func decode(_ data: Data) -> String? {
-        if hasUTF16Mark(data) { return String(data: data, encoding: .utf16) }
+        // A lossy fallback, as UTF-8 gets below: one lone surrogate otherwise made the whole
+        // file unsearchable.
+        if hasUTF16Mark(data) { return String(data: data, encoding: .utf16) ?? utf16Lossy(data) }
         if isBinary(data) { return nil }
         // Latin-1 last: it accepts every byte, including the five Windows-1252 leaves undefined
         // (0x81, 0x8D, 0x8F, 0x90, 0x9D), which Mac Roman text uses for letters.
@@ -513,6 +555,21 @@ enum SearchEngine {
         }
         if valid > invalid { return lossy }
         return String(data: data, encoding: .windowsCP1252) ?? String(data: data, encoding: .isoLatin1)
+    }
+
+    /// UTF-16 unit by unit, replacing a lone surrogate with U+FFFD rather than refusing the file.
+    private static func utf16Lossy(_ data: Data) -> String {
+        let big = data.starts(with: [0xFE, 0xFF])
+        let payload = Array(data.dropFirst(2))
+        var units = [UInt16]()
+        units.reserveCapacity(payload.count / 2)
+        var index = 0
+        while index + 1 < payload.count {
+            let (first, second) = (UInt16(payload[index]), UInt16(payload[index + 1]))
+            units.append(big ? first << 8 | second : second << 8 | first)
+            index += 2
+        }
+        return String(decoding: units, as: UTF16.self)
     }
 
     /// A NUL byte in the first 8 KB, with no UTF-16 byte order mark to account for it.

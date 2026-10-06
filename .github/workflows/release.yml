@@ -220,7 +220,7 @@ jobs:
           if [[ "$SIGNED" == "true" ]]; then
             SIGNATURE="self-signed"
           fi
-          NOTES="This build is $SIGNATURE"$', not notarised — there is no Apple Developer Program\nmembership behind it yet. macOS Gatekeeper will call the download damaged or from an\nunidentified developer on first launch. To open it: right-click FinderPlus.app → Open, or run\n`xattr -cr /path/to/FinderPlus.app` in Terminal.\n\n'
+          NOTES="This build is $SIGNATURE"$', not notarised — there is no Apple Developer Program\nmembership behind it yet. macOS Gatekeeper will call the download damaged or from an\nunidentified developer on first launch. To open it: launch it once and dismiss the dialog, then\nclick Open Anyway in System Settings → Privacy & Security — or run\n`xattr -cr /path/to/FinderPlus.app` in Terminal. (Right-click → Open no longer gets past\nGatekeeper on current macOS.)\n\n'
           # --generate-notes adds the changes since the last tag after the notice above.
           gh release create "$TAG" "$ASSET" \
             --title "FinderPlus $VERSION" \

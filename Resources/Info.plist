@@ -99,5 +99,7 @@
 	<string>FinderPlus asks Finder which folder its front window shows, so you can search the Active Finder Window, and has Finder open a new window when you choose Show in Finder.</string>
 	<key>NSNetworkVolumesUsageDescription</key>
 	<string>FinderPlus searches network volumes when you search all volumes.</string>
+	<key>NSFileProviderDomainUsageDescription</key>
+	<string>FinderPlus searches files managed by iCloud Drive and other cloud services when they are in the location you choose.</string>
 </dict>
 </plist>

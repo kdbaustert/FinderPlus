@@ -164,8 +164,10 @@ git tag v1.3.0-beta && git push origin v1.3.0-beta  # a beta, offered only to co
 
 The update feed is served by GitHub Pages from the `gh-pages` branch. To check a release before
 tagging it, `VERSION=1.2.0 BUILD=40 ./release.sh [--beta]` builds the zip and the feed locally
-without publishing anything. Releases are signed without an Apple Developer ID, so the first
-download needs right-click → **Open**; updates after that install normally.
+without publishing anything. Releases are signed without an Apple Developer ID, so macOS blocks
+the first launch: dismiss the dialog, then click **Open Anyway** in System Settings →
+**Privacy & Security** — or run `xattr -cr /Applications/FinderPlus.app`. (Right-click → **Open**
+no longer gets past Gatekeeper on current macOS.) Updates after that install normally.
 
 Building needs Xcode. To change the app icon, edit `Resources/Icon/make-icon.swift` and run
 `swift Resources/Icon/make-icon.swift` from the repository root before building.

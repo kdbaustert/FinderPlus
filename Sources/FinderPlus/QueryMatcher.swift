@@ -36,21 +36,47 @@ struct QueryMatcher: @unchecked Sendable {
     }
 
     private enum Pattern {
-        case regex(NSRegularExpression)
+        /// `guarded` for a pattern the user wrote in Regular Expression mode, whose backtracking
+        /// can run away; literal and wildcard patterns are escaped, never nest quantifiers, and
+        /// skip the guard's overhead.
+        case regex(NSRegularExpression, guarded: Bool)
         /// An unanchored wildcard with a `*` between pieces, such as `a*z`.
         case pieces([NSRegularExpression])
         case fuzzy(FuzzyPattern)
 
         func find(in text: String) -> NSRange? {
             switch self {
-            case .regex(let regex):
-                let range = regex.rangeOfFirstMatch(in: text, range: NSRange(location: 0, length: (text as NSString).length))
+            case .regex(let regex, let guarded):
+                let whole = NSRange(location: 0, length: (text as NSString).length)
+                if guarded { return Self.guardedFirstMatch(regex, in: text, range: whole) }
+                let range = regex.rangeOfFirstMatch(in: text, range: whole)
                 return range.location == NSNotFound ? nil : range
             case .pieces(let pieces):
                 return Self.find(pieces, in: text, from: 0)
             case .fuzzy(let pattern):
                 return pattern.find(in: text)
             }
+        }
+
+        /// How long one runaway pattern may hold one text before it is treated as not matching.
+        /// ICU backtracks exponentially on patterns like `(a+)+$`, and `rangeOfFirstMatch` cannot
+        /// be interrupted — not even by Stop — so a guarded match goes through
+        /// `enumerateMatches`, whose `.reportProgress` calls back mid-match.
+        static let matchBudget: Duration = .seconds(2)
+
+        static func guardedFirstMatch(_ regex: NSRegularExpression, in text: String, range: NSRange) -> NSRange? {
+            let deadline = ContinuousClock.now + matchBudget
+            var found: NSRange?
+            regex.enumerateMatches(in: text, options: .reportProgress, range: range) { match, _, stop in
+                if let match {
+                    found = match.range
+                    stop.pointee = true
+                } else if ContinuousClock.now >= deadline {
+                    stop.pointee = true
+                }
+            }
+            guard let found, found.location != NSNotFound else { return nil }
+            return found
         }
 
         /// Each piece after the one before, all on one line — what `a.*z` means, since `.` stops at
@@ -102,7 +128,13 @@ struct QueryMatcher: @unchecked Sendable {
         // NFC, as `subject(for:)` is: NSRegularExpression compares code points, so a composed "é"
         // would never find a decomposed one (e + combining accent). Folding already strips both.
         let source = options.ignoreDiacritics ? Self.fold(trimmed) : trimmed.precomposedStringWithCanonicalMapping
-        let regexOptions: NSRegularExpression.Options = options.ignoreCase ? [.caseInsensitive] : []
+        // `anchorsMatchLines`, so `^` and `$` mean a line, as grep's do: against file contents a
+        // whole-text anchor matches next to nothing, every other pattern is escaped and carries
+        // no anchor, and `\A` and `\z` still mean the whole text.
+        let regexOptions: NSRegularExpression.Options =
+            options.ignoreCase ? [.caseInsensitive, .anchorsMatchLines] : [.anchorsMatchLines]
+        // Only Regular Expression mode takes patterns whose backtracking can run away.
+        let guarded = options.mode == .regex
 
         func compile(_ full: String, reporting pattern: String) throws -> NSRegularExpression {
             do {
@@ -114,7 +146,7 @@ struct QueryMatcher: @unchecked Sendable {
         // Lookarounds rather than `\b`, which needs a word character beside it: with `\b`, "C++",
         // ".NET" and "#urgent" could never match, not even a file named exactly that.
         func regex(_ pattern: String, bounded: Bool = options.wholeWords) throws -> Pattern {
-            .regex(try compile(bounded ? "(?<!\\w)(?:\(pattern))(?!\\w)" : pattern, reporting: pattern))
+            .regex(try compile(bounded ? "(?<!\\w)(?:\(pattern))(?!\\w)" : pattern, reporting: pattern), guarded: guarded)
         }
         func exact(_ text: String) throws -> Pattern {
             try regex(NSRegularExpression.escapedPattern(for: text))
@@ -186,11 +218,14 @@ struct QueryMatcher: @unchecked Sendable {
         // Never trust a range past the end: an excerpt must not be able to crash a search.
         range.location = min(range.location, subject.length)
         range.length = min(range.length, subject.length - range.location)
-        // Folding usually preserves UTF-16 length; when it does, excerpt the original so the
-        // snippet keeps its accents. NFC keeps them anyway, and can lengthen one sequence while
-        // shortening another, so equal lengths would prove nothing: excerpt what was matched.
+        // Folding usually preserves UTF-16 length; when it does — and the text carries none of
+        // `lengtheningMarks`, which can trade a gain against a loss — excerpt the original so
+        // the snippet keeps its accents. NFC keeps them anyway, and can lengthen one sequence
+        // while shortening another, so equal lengths would prove nothing: excerpt what was
+        // matched.
         let original = text as NSString
-        let source = foldsDiacritics && original.length == subject.length ? original : subject
+        let source = foldsDiacritics && original.length == subject.length
+            && !Self.foldMayShiftOffsets(text) ? original : subject
         let start = max(0, range.location - context)
         let end = min(source.length, range.location + range.length + context * 2)
         let window = source.rangeOfComposedCharacterSequences(
@@ -216,24 +251,30 @@ struct QueryMatcher: @unchecked Sendable {
     /// bounds the work on a huge file.
     func ranges(in text: String, limit: Int = 500) -> [NSRange] {
         // Folded or NFC as `matches` sees it, or a file that matched could highlight nothing.
-        // Folding never lengthens a character (checked across every Unicode scalar), so a folded
-        // text of the same length has every offset where it was: the usual case, left unmapped,
-        // since the map costs twenty times the fold (206 ms against 10 on a megabyte of French). A
-        // shorter one lost a decomposed accent's combining mark, and every match after "e\u{301}"
-        // would land early. NFC can lengthen one sequence and shorten another, so a length check
-        // proves nothing there (see `snippet`). Both of those are mapped back.
+        // Folding never lengthens a scalar on its own, so a folded text of the same length
+        // usually has every offset where it was: that case is left unmapped, since the map costs
+        // twenty times the fold (206 ms against 10 on a megabyte of French). A shorter one lost
+        // a decomposed accent's combining mark, and every match after "e\u{301}" would land
+        // early — and a text carrying one of `lengtheningMarks` can balance a loss against a
+        // gain, so equal length proves nothing there. NFC can do the same (see `snippet`). All
+        // of those are mapped back.
         let folded = foldsDiacritics ? Self.fold(text) : nil
-        let composition = folded?.utf16.count == text.utf16.count ? nil : Composition(
+        let aligned = folded?.utf16.count == text.utf16.count && !Self.foldMayShiftOffsets(text)
+        let composition = aligned ? nil : Composition(
             text, as: foldsDiacritics ? Self.fold : { $0.precomposedStringWithCanonicalMapping })
         let subject = composition?.subject ?? folded ?? text
         let whole = NSRange(location: 0, length: (subject as NSString).length)
         var found: [NSRange] = []
         for pattern in clauses.flatMap(\.required) {
             switch pattern {
-            case .regex(let regex):
-                regex.enumerateMatches(in: subject, range: whole) { match, _, stop in
+            case .regex(let regex, let guarded):
+                let deadline = ContinuousClock.now + Pattern.matchBudget
+                regex.enumerateMatches(
+                    in: subject, options: guarded ? [.reportProgress] : [], range: whole
+                ) { match, _, stop in
                     if let match, match.range.length > 0 { found.append(match.range) }
                     if found.count >= limit { stop.pointee = true }
+                    if guarded, match == nil, ContinuousClock.now >= deadline { stop.pointee = true }
                 }
             case .pieces(let pieces):
                 var start = 0
@@ -344,6 +385,23 @@ struct QueryMatcher: @unchecked Sendable {
 
     static func fold(_ text: String) -> String {
         text.folding(options: .diacriticInsensitive, locale: nil)
+    }
+
+    /// The combining marks whose fold grows after a base letter — Kannada and Telugu two-part
+    /// vowel signs, Tibetan vowels and subjoined consonants, Balinese, Sharada, Tulu-Tigalari
+    /// and Gurung Khema vowel signs. No scalar lengthens on its own (checked exhaustively), but
+    /// after one of these a folded text can keep its total length with every offset behind the
+    /// mark shifted, so equal length stops proving alignment.
+    private static let lengtheningMarks: Set<UInt32> = [
+        0x0C48, 0x0CC0, 0x0CC7, 0x0CC8, 0x0CCA, 0x0CCB,
+        0x0F73, 0x0F75, 0x0F76, 0x0F78, 0x0F81, 0x0F93, 0x0F9D, 0x0FA2, 0x0FA7, 0x0FAC, 0x0FB9,
+        0x1B3B, 0x1B3D, 0x1B43,
+        0x1112E, 0x1112F, 0x113C5, 0x113C7, 0x113C8,
+        0x16121, 0x16122, 0x16123, 0x16124, 0x16125, 0x16126, 0x16127, 0x16128,
+    ]
+
+    static func foldMayShiftOffsets(_ text: String) -> Bool {
+        text.unicodeScalars.contains { $0.value >= 0x0C48 && lengtheningMarks.contains($0.value) }
     }
 
     /// Splits on whitespace, keeps "quoted phrases" together, and marks `-word` as excluded.

@@ -178,11 +178,22 @@ echo "==> Built $APP"
 if [[ "${1:-}" == "--install" ]]; then
     echo "==> Installing to /Applications"
     osascript -e 'quit app "FinderPlus"' 2>/dev/null || true
-    for _ in $(seq 1 30); do
-        pgrep -x FinderPlus >/dev/null 2>&1 || break
+    # The app holds quit open while a rename, copy or move batch is mid-flight — killed then, a
+    # rename's files stay stranded under hidden holding names — so the kill waits a minute for the
+    # batch to drain rather than landing three seconds in.
+    WAITED=0
+    while pgrep -x FinderPlus >/dev/null 2>&1; do
+        if (( WAITED == 30 )); then
+            echo "==> FinderPlus is still running (a file batch may be finishing); waiting up to 60s"
+        fi
+        if (( WAITED >= 600 )); then
+            echo "==> Still running after 60s: killing it" >&2
+            pkill -9 -x FinderPlus 2>/dev/null || true
+            break
+        fi
         sleep 0.1
+        WAITED=$((WAITED + 1))
     done
-    pkill -9 -x FinderPlus 2>/dev/null || true
     # Copied beside the old copy first, so a failed copy leaves it installed; only the rename below
     # runs with no app in place. Not named *.app, so nothing registers the half-copied bundle.
     STAGED="/Applications/.FinderPlus-installing"

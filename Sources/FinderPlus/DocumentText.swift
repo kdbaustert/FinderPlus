@@ -12,7 +12,8 @@ enum DocumentText {
     // MARK: - Zipped XML documents
 
     /// Office Open XML, OpenDocument and EPUB files are zip archives of XML. These are the
-    /// members that hold their text; `unzip` matches the patterns itself, across folders.
+    /// members that hold their text; `bsdtar` matches the patterns itself, and its `*` crosses
+    /// folders.
     static func zipMembers(forExtension ext: String) -> [String]? {
         switch ext {
         case "xlsx", "xlsm": ["xl/sharedStrings.xml", "xl/worksheets/*.xml"]
@@ -23,17 +24,22 @@ enum DocumentText {
         }
     }
 
-    /// Streams the members out with `unzip -p`, stopping once `maxBytes` have been read, and
-    /// returns their text without markup.
+    /// Streams the members out with `bsdtar -xO`, stopping once `maxBytes` have been read, and
+    /// returns their text without markup. `bsdtar` rather than `unzip`: unzip expands `[`, `?`
+    /// and `*` in the archive's own file name too, so "Q[1].xlsx" was read as a sibling
+    /// "Q1.xlsx" whenever one existed.
     static func zipText(
         of url: URL, members: [String], maxBytes: Int, isStopped: () -> Bool = { Task.isCancelled }
     ) -> String? {
         let process = Process()
-        process.executableURL = URL(filePath: "/usr/bin/unzip")
-        process.arguments = ["-p", url.path] + members
+        process.executableURL = URL(filePath: "/usr/bin/bsdtar")
+        process.arguments = ["-xOf", url.path] + members
         let output = Pipe()
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
+        // No stdin: asked for a passphrase (an encrypted member, run under a terminal), bsdtar
+        // then fails at once instead of waiting on a prompt nobody sees.
+        process.standardInput = FileHandle.nullDevice
         do { try process.run() } catch { return nil }
         var data = Data()
         while data.count < maxBytes, !isStopped(),
@@ -44,14 +50,26 @@ enum DocumentText {
         if process.isRunning { process.terminate() }
         process.waitUntilExit()
         guard !data.isEmpty, !isStopped() else { return nil }
-        return markupText(String(decoding: data, as: UTF8.self))
+        var markup = String(decoding: data, as: UTF8.self)
+        // A worksheet cell with t="s" holds an index into sharedStrings.xml, not text: left in,
+        // every number up to the string count matched a content search. The strings themselves
+        // come from sharedStrings.xml, which is read alongside.
+        markup = markup.replacing(/<c\b[^>]*\bt="s"[^>]*>[\s\S]*?<\/c>/, with: " ")
+        return markupText(markup, isStopped: isStopped)
     }
 
-    /// Text from HTML or XML. Tags become spaces, so neighbouring runs of text ("<a:t>Q3</a:t>
-    /// <a:t>report</a:t>") do not fuse into one word; scripts and styles are dropped entirely.
-    static func markupText(_ markup: String) -> String {
+    /// Text from HTML or XML. A block-level tag becomes a space; an inline one — a styled run, a
+    /// link, a span — becomes nothing, so a word split across runs ("<a:t>Quar</a:t>
+    /// <a:t>terly</a:t>", or a drop-cap "<span>Q</span>uarterly") stays one word; scripts and
+    /// styles are dropped entirely. `isStopped` is read between passes, each one regex over the
+    /// whole text at roughly a quarter second per megabyte.
+    static func markupText(_ markup: String, isStopped: () -> Bool = { false }) -> String {
         var text = markup.replacing(/<(script|style)\b[\s\S]*?<\/\1>/.ignoresCase(), with: " ")
+        if isStopped() { return "" }
+        text = text.replacing(inlineTagPattern, with: "")
+        if isStopped() { return "" }
         text = text.replacing(/<[^>]*>/, with: " ")
+        if isStopped() { return "" }
         // One pass, so "&amp;lt;" decodes to "&lt;" and no further. An unknown name is left as
         // written.
         text = text.replacing(/&(#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});/) { match in
@@ -66,8 +84,34 @@ enum DocumentText {
             guard let scalar, scalar != "\0" else { return String(match.output.0) }
             return String(Character(scalar))
         }
+        // A soft hyphen sits inside a word, and "Quar\u{AD}terly" would never match "quarterly".
+        // After the entities, so "&shy;" goes with it.
+        text = text.replacing("\u{AD}", with: "")
         return text.replacing(/\s+/, with: " ")
     }
+
+    /// Tags that wrap text within a line, across HTML, Office Open XML's runs and OpenDocument's
+    /// spans. Everything not named here — including an unknown tag — still reads as a space,
+    /// which separates words where the markup separated them.
+    private static let inlineTagNames = [
+        // HTML.
+        "a", "abbr", "acronym", "b", "bdi", "bdo", "big", "cite", "code", "data", "del", "dfn",
+        "em", "font", "i", "ins", "kbd", "mark", "nobr", "q", "rp", "rt", "ruby", "s", "samp",
+        "small", "span", "strike", "strong", "sub", "sup", "time", "tt", "u", "var", "wbr",
+        // Office Open XML: a run, its properties and its text, in slides and in shared strings.
+        "r", "rPr", "t", "is", "a:r", "a:rPr", "a:t",
+        // OpenDocument.
+        "text:span", "text:a",
+    ]
+
+    /// `nonisolated(unsafe)` for the same reason QueryMatcher is `@unchecked Sendable`: built
+    /// once, never mutated, and matching does not mutate — Regex just carries no Sendable mark.
+    private nonisolated(unsafe) static let inlineTagPattern: Regex<AnyRegexOutput> = {
+        let names = inlineTagNames.map { NSRegularExpression.escapedPattern(for: $0) }.joined(separator: "|")
+        // The alternation must end at the tag name: "<a href=…>" is inline, "<abbr>" is matched
+        // whole, and "<address>" is no "a".
+        return try! Regex("</?(?:\(names))(?:[\\s/][^>]*)?>").ignoresCase()
+    }()
 
     /// HTML's named characters for Latin-1 and typography, the ones text actually uses. Greek
     /// letters and maths symbols are left out. A non-breaking space reads as a plain one, so

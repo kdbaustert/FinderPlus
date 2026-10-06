@@ -80,6 +80,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingQuery: String?
 
     /// Not while a batch runs, or closing the last window would quit without waiting for it.
+    /// AppKit asks only at that moment, so `batchesDrained` finishes the quit later.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         SearchModel.batchesInFlight == 0
     }
@@ -88,14 +89,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// stopped mid-batch leaves files under hidden holding names.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard SearchModel.batchesInFlight > 0 else { return .terminateNow }
-        SearchModel.onBatchesDrained = {
-            SearchModel.onBatchesDrained = nil
-            NSApp.reply(toApplicationShouldTerminate: true)
-        }
+        waitingToTerminate = true
         return .terminateLater
     }
 
+    /// A quit held back by `applicationShouldTerminate`.
+    private var waitingToTerminate = false
+
+    /// The last batch is done: let a held quit finish, or — with the last window closed while the
+    /// batch ran, when `applicationShouldTerminateAfterLastWindowClosed` had to answer false and
+    /// is never asked again — quit now rather than linger with no window.
+    private func batchesDrained() {
+        if waitingToTerminate {
+            waitingToTerminate = false
+            NSApp.reply(toApplicationShouldTerminate: true)
+        } else if !NSApp.windows.contains(where: { $0.isVisible && $0.canBecomeKey }) {
+            NSApp.terminate(nil)
+        }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        SearchModel.onBatchesDrained = { [weak self] in self?.batchesDrained() }
         NSApp.servicesProvider = self
         NSUpdateDynamicServices()
         // Keeps the Siri phrases for the Shortcuts actions current.
@@ -195,8 +209,11 @@ struct SearchCommands: Commands {
                     .keyboardShortcut(.delete)
                     // ⌘⌫ in the search field deletes to the start of the line; menu shortcuts are
                     // matched first, so without this it would trash the selected results instead.
-                    // The same goes for the Rename sheet's fields, whose files are the selection.
-                    .disabled(model.selection.isEmpty || model.isEditingQuery || model.renameRequest != nil)
+                    // The same goes for the Rename sheet's fields, whose files are the selection,
+                    // and for the ⌘L folder picker, whose name field is just as editable.
+                    .disabled(
+                        model.selection.isEmpty || model.isEditingQuery || model.renameRequest != nil
+                            || model.choosingFolder)
             }
         }
         CommandGroup(replacing: .sidebar) {

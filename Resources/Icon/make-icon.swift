@@ -238,6 +238,11 @@ for size in [16, 32, 128, 256, 512] {
         sips.standardOutput = FileHandle.nullDevice
         try sips.run()
         sips.waitUntilExit()
+        // A failed resize would leave Contents.json naming a PNG that does not exist, and build.sh
+        // only checks that Assets.car was written at all.
+        guard sips.terminationStatus == 0 else {
+            fatalError("sips exited \(sips.terminationStatus) resizing to \(size * scale)px")
+        }
         entries.append(#"{ "idiom" : "mac", "size" : "\#(size)x\#(size)", "scale" : "\#(scale)x", "filename" : "\#(name)" }"#)
     }
 }

@@ -144,10 +144,15 @@ struct SearchInFinderPlusIntent: AppIntent {
             throw IntentMessage("FinderPlus couldn’t start the search. Open it and try again.")
         }
         // A folder that was given but can't be reached is an error, not a reason to search the
-        // window's current location.
+        // window's current location. Checked on disk too: handed a path that no longer exists,
+        // `useFolders` would quietly search its parent and keep it in the Location menu.
         var root: URL?
         if let folder {
-            guard let url = folder.fileURL else { throw IntentMessage("That folder isn’t available.") }
+            var isDirectory: ObjCBool = false
+            guard let url = folder.fileURL,
+                  FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+                  isDirectory.boolValue
+            else { throw IntentMessage("That folder isn’t available.") }
             root = url
         }
         delegate.searchFromIntent(query: query, folder: root)

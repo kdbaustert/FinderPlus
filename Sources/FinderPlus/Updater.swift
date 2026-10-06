@@ -85,6 +85,15 @@ final class Updater {
             controller.updater.observe(\.lastUpdateCheckDate, options: [.new]) { [weak self] updater, _ in
                 MainActor.assumeIsolated { self?.lastCheck = updater.lastUpdateCheckDate }
             },
+            // Sparkle's own update alert carries an "Automatically download and install" checkbox
+            // (and its permission prompt one for checking), which write past the setters above.
+            // Without these, a box ticked there left the Settings toggle showing off.
+            controller.updater.observe(\.automaticallyDownloadsUpdates, options: [.new]) { [weak self] _, _ in
+                MainActor.assumeIsolated { self?.withMutation(keyPath: \.automaticallyDownloads) {} }
+            },
+            controller.updater.observe(\.automaticallyChecksForUpdates, options: [.new]) { [weak self] _, _ in
+                MainActor.assumeIsolated { self?.withMutation(keyPath: \.automaticallyChecks) {} }
+            },
         ]
     }
 

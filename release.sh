@@ -10,14 +10,18 @@
 #
 # VERSION is what people see. BUILD is what Sparkle compares to decide whether an update is newer,
 # so it must be a whole number that grows with every release, betas and stable alike (the workflow
-# uses the commit count). A BUILD not above every build already in the feed is raised to one that
-# is: two releases with the same build would share, and garble, one feed entry.
+# uses the commit count). A BUILD the feed already carries — the same commit released again, as
+# when a beta is promoted to stable — is raised to the next free one: two releases with the same
+# build would share, and garble, one feed entry. A BUILD not above its own channel's newest is
+# refused instead, since no copy would be offered it — and raising it past every channel would
+# offer a stable hotfix to beta copies as an "update" that is really a downgrade.
 #
 # The workflow signs with its signing identity when it has one and ad-hoc when it doesn't; a hand
 # run signs as "FinderPlus Local" when that certificate is in the keychain (see build.sh's
-# CODESIGN_IDENTITY). Either way there is no Developer ID behind them. Gatekeeper flags the first
-# download (right-click → Open, or `xattr -cr` on the app, gets past it once); updates after that
-# arrive through Sparkle, which checks each one against the EdDSA key instead.
+# CODESIGN_IDENTITY). Either way there is no Developer ID behind them. Gatekeeper blocks the first
+# launch: since macOS 15 right-click → Open no longer gets past it, so it takes System Settings ›
+# Privacy & Security › Open Anyway after the blocked-launch dialog, or `xattr -cr` on the app.
+# Updates after that arrive through Sparkle, which checks each one against the EdDSA key instead.
 #
 # Environment:
 #   SPARKLE_KEY_FILE  sign the feed with a private key file instead of the login keychain (the
@@ -119,10 +123,29 @@ if [[ -f "$STAGING/appcast.xml" ]]; then
     if [[ -n "${EXISTING_ZIP:-}" ]]; then
         # A re-run after the feed was already published: check that entry rather than write another.
         [[ "$(feed_value "count($ITEM)")" != 0 ]] && ENTRY_EXISTS=1
-    elif (( BUILD <= LATEST )); then
-        echo "==> NOTE: build $BUILD is not above the feed's highest build ($LATEST); releasing as build $((LATEST + 1))"
+    elif [[ "$(feed_value "count($ITEM)")" != 0 ]]; then
+        # The same commit released again — a beta promoted to stable keeps its commit count — takes
+        # the next free build rather than garbling the entry already published under this one.
+        echo "==> NOTE: the feed already has an entry for build $BUILD; releasing as build $((LATEST + 1))"
         BUILD=$((LATEST + 1))
         ITEM="/rss/channel/item[$(sparkle version) = \"$BUILD\"]"
+    else
+        # What this release's own audience already has: beta copies see every entry, stable copies
+        # only the channel-less ones. Below that, the release would never be offered — and raising
+        # it past every channel instead would hand beta users a stable hotfix as an "update" that
+        # silently downgrades them, so it stops here.
+        if [[ "$BETA" == "1" ]]; then
+            AUDIENCE_LATEST="$LATEST"
+        else
+            STABLE_VERSIONS="/rss/channel/item[not($(sparkle channel))]/$(sparkle version)"
+            AUDIENCE_LATEST="$(feed_value "string(${STABLE_VERSIONS}[not(. < $STABLE_VERSIONS)])")"
+            AUDIENCE_LATEST="${AUDIENCE_LATEST:-0}"
+        fi
+        if (( BUILD <= AUDIENCE_LATEST )); then
+            echo "==> ERROR: build $BUILD is not above its own channel's newest ($AUDIENCE_LATEST), so no copy would be offered it" >&2
+            echo "    Tag a commit past the one that made build $AUDIENCE_LATEST, or set BUILD above it yourself" >&2
+            exit 1
+        fi
     fi
 fi
 

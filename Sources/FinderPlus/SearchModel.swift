@@ -259,6 +259,13 @@ final class SearchModel {
     /// size and dates of the last run: the fresh hit replaces it, and one never reported is dropped
     /// when the walk ends.
     @ObservationIgnored private var unconfirmed: Set<FileHit.ID> = []
+    /// Renames and moves made while this search's walk is still running, old path to new. The
+    /// walk's enumerator and buffers hold hits it found before the change landed; applied to each
+    /// incoming batch, those stragglers arrive under the paths the files have now instead of
+    /// becoming rows nothing on disk answers to.
+    @ObservationIgnored private var walkRelocations: [String: String] = [:]
+    /// Paths trashed while this search's walk is still running; a straggler under one is dropped.
+    @ObservationIgnored private var walkTrashed: Set<String> = []
 
     /// What decides whether the rows on screen would all be found again: the folders actually
     /// walked (so a different front Finder window or an ejected drive counts as a change), the
@@ -280,6 +287,9 @@ final class SearchModel {
 
     var isSearching: Bool { phase == .searching }
     var location: SearchLocation { SearchLocation(id: locationID) }
+    /// The location the results on screen came from, for the window subtitle: the menu can move
+    /// on to another choice without making "N matches in <here>" claim the wrong folder.
+    private(set) var searchedLocation: SearchLocation?
     /// Set by ⌘L or "Select…"; the window presents a folder picker while it is true.
     var choosingFolder = false
     var selectedURLs: [URL] { targets(nil) }
@@ -318,6 +328,9 @@ final class SearchModel {
         unreadable = 0
         reachedLimit = false
         currentPath = ""
+        walkRelocations = [:]
+        walkTrashed = []
+        searchedLocation = location
         searchedContents = options.readsInsideFiles
         phase = .searching
 
@@ -349,11 +362,12 @@ final class SearchModel {
             // Off the main actor: one existence check per row stalls the window on a network volume.
             // A row moved outside the roots since is not kept: the walk would never report it. The
             // roots as the walk reports them — a root under /var is walked as /private/var.
-            let (rows, roots) = (refine.rows, request.roots)
+            let (rows, roots, matcher) = (refine.rows, request.roots, request.nameMatcher)
             let kept = await Self.offMain {
                 let prefixes = roots.map(SearchEngine.walkedPath).map { $0.hasSuffix("/") ? $0 : $0 + "/" }
                 return rows.filter { hit in
-                    !Task.isCancelled && prefixes.contains { hit.url.path.hasPrefix($0) }
+                    !Task.isCancelled && matcher.matches(hit.name)
+                        && prefixes.contains { hit.url.path.hasPrefix($0) }
                         && FileManager.default.fileExists(atPath: hit.url.path)
                 }
             }
@@ -371,8 +385,10 @@ final class SearchModel {
         }
     }
 
-    /// The rows on screen the new walk should report again, still to be checked on disk and
-    /// against the roots. Content searches never keep rows — a kept row would keep the old
+    /// The rows on screen the new walk should report again, still to be checked on disk, against
+    /// the roots and against the new query — the last two off the main actor, in `start()`'s
+    /// filter: a guarded regex may spend its whole budget per name, which must not happen on the
+    /// main thread row by row. Content searches never keep rows — a kept row would keep the old
     /// query's snippet — and neither do searches with a match limit, which kept rows could push
     /// past. Nor is an archive entry: the zip still existing says nothing of the entry, and the
     /// walk re-lists it.
@@ -380,8 +396,7 @@ final class SearchModel {
         let run = Run(roots: request.roots.map(\.path), options: request.options, limits: request.limits)
         guard lastRun == run, run.options.searchNames, !run.options.readsInsideFiles, run.limits.maxResults == 0
         else { return (run, []) }
-        let rows = results.filter { !$0.isArchiveEntry && request.nameMatcher.matches($0.name) }
-        return (run, rows)
+        return (run, results.filter { !$0.isArchiveEntry })
     }
 
     /// Starts the new run's rows from those kept. `lastRun` changes only here, together with the
@@ -480,6 +495,14 @@ final class SearchModel {
     /// is found by binary search: comparing it against every row on screen instead fell behind the
     /// walk at around 200,000 results.
     private func insertSorted(_ hits: [FileHit]) {
+        var hits = hits
+        // Stragglers from before a rename, move or trash landed mid-walk (see `walkRelocations`).
+        if !walkTrashed.isEmpty {
+            hits.removeAll { Self.isUnder($0.url.path, walkTrashed) }
+        }
+        if !walkRelocations.isEmpty {
+            hits = Self.relocate(hits, walkRelocations)
+        }
         if !unconfirmed.isEmpty {
             // A kept row makes way for its fresh hit, which is merged in below like any other.
             var refreshed: Set<FileHit.ID> = []
@@ -640,8 +663,9 @@ final class SearchModel {
         if let first = folders.first { locationID = first.id }
     }
 
-    /// From Finder's service or the Dock icon: search in these folders. A file stands for the
-    /// folder that holds it.
+    /// From Finder's service or the Dock icon. The first folder becomes the location and the rest
+    /// join the Location menu: a search runs in one location, so handing over several folders
+    /// searches the first. A file stands for the folder that holds it.
     func useFolders(_ urls: [URL]) {
         // Resolved first: a symlink to a folder reports isDirectory false, and would stand for
         // the folder that holds the link.
@@ -770,7 +794,10 @@ final class SearchModel {
         // Only files on disk: a file inside an archive cannot be trashed on its own, and trashing
         // the archive because one entry was selected would take everything else in it too.
         var seen = Set<URL>()
-        let urls = hits(ids).filter { !$0.isArchiveEntry }.map(\.url).filter { seen.insert($0).inserted }
+        var urls = hits(ids).filter { !$0.isArchiveEntry }.map(\.url).filter { seen.insert($0).inserted }
+        // A folder trashed takes its contents with it, so a selected item inside a selected
+        // folder (⌘A does this) is covered by the folder and dropped here, as Finder drops it.
+        urls = Self.withoutNestedSources(urls)
         guard !urls.isEmpty else {
             NSSound.beep()
             return
@@ -788,22 +815,22 @@ final class SearchModel {
         let outcome = await Self.recycle(urls)
         // Rows inside a trashed folder go with it, found by walking each row's path up, as
         // `relocate` does: one set lookup per level rather than a prefix test per trashed item.
+        // An archive entry's row carries the archive's path, so a trashed zip takes its entries.
         let trashed = Set(outcome.trashed.map(\.path))
-        results.removeAll { hit in
-            var path = hit.url.path
-            while !path.isEmpty, path != "/" {
-                if trashed.contains(path) { return true }
-                path = (path as NSString).deletingLastPathComponent
-            }
-            return false
+        results.removeAll { Self.isUnder($0.url.path, trashed) }
+        // The rows the duplicates view would restore too, or Show All Results brought a trashed
+        // zip's entries back.
+        resultsBeforeDuplicates = resultsBeforeDuplicates.map { rows in
+            rows.filter { !Self.isUnder($0.url.path, trashed) }
         }
+        if isSearching { walkTrashed.formUnion(trashed) }
         let remaining = Set(results.map(\.id))
         selection.formIntersection(remaining)
         knownIDs.formIntersection(remaining)
 
         let refused = urls.filter { !outcome.trashed.contains($0) }
         guard !refused.isEmpty, !outcome.failed.isEmpty else { return }
-        if outcome.deniedByPermissions {
+        if outcome.deniedByPermissions, !Self.hasFullDiskAccess() {
             explainPermission(toDo: "delete", refused, failures: outcome.failed)
         } else {
             let alert = NSAlert()
@@ -856,11 +883,13 @@ final class SearchModel {
 
     /// One refused item's line for an alert, and whether Full Disk Access could fix it. `item` is
     /// where the file is now, for the lock check; `name` is what the user knows it as.
+    /// `lockMatters` is false for operations a lock does not refuse, such as copying: blaming the
+    /// lock there sends the user to unlock a file that was never the problem.
     nonisolated static func failure(
-        _ error: any Error, of item: URL, named name: String? = nil
+        _ error: any Error, of item: URL, named name: String? = nil, lockMatters: Bool = true
     ) -> (line: String, needsAccess: Bool) {
         let name = name ?? item.lastPathComponent
-        if isLocked(item) {
+        if lockMatters, isLocked(item) {
             return ("\(name): The item is locked. Unlock it in its Get Info window in Finder.", false)
         }
         return ("\(name): \(error.localizedDescription)", isPermissionError(error))
@@ -868,7 +897,9 @@ final class SearchModel {
 
     /// macOS refuses to trash files in protected places until FinderPlus has Full Disk Access; files
     /// owned by the system need Finder, which can ask for an administrator password. Every failure
-    /// in the batch is listed, not just the ones access would fix.
+    /// in the batch is listed, not just the ones access would fix. Shown only when access is
+    /// actually off — the callers check — since a plain POSIX refusal (a read-only folder, a
+    /// root-owned one) arrives as the same error and no amount of access fixes it.
     private func explainPermission(toDo verb: String, _ urls: [URL], failures: [String]) {
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -876,10 +907,11 @@ final class SearchModel {
         alert.informativeText = failures.joined(separator: "\n") + "\n\n" + """
             macOS blocked this. Turn on FinderPlus in System Settings › Privacy & \
             Security › Full Disk Access, then try again.
-
-            Files that belong to macOS itself can only be deleted in Finder, which asks for an \
-            administrator password.
             """
+        if verb == "delete" {
+            alert.informativeText += "\n\nFiles that belong to macOS itself can only be deleted "
+                + "in Finder, which asks for an administrator password."
+        }
         alert.addButton(withTitle: "Open Full Disk Access Settings")
         alert.addButton(withTitle: "Show in Finder")
         alert.addButton(withTitle: "Cancel")
@@ -943,11 +975,22 @@ final class SearchModel {
         let header = "Name\tLocation\tKind\tSize\tDate Modified"
         let lines = rows.map { hit in
             [hit.name, hit.parentPath, hit.kind, hit.sizeText, hit.modified.formatted(date: .abbreviated, time: .shortened)]
-                .joined(separator: "\t")
+                .map(Self.tsvField).joined(separator: "\t")
         }
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(([header] + lines).joined(separator: "\n"), forType: .string)
+    }
+
+    /// The formula guard `csvField` applies, for the pasteboard table: pasted into a spreadsheet,
+    /// a name starting with "=" would run, and a tab or line break in one would shift every cell
+    /// after it.
+    nonisolated static func tsvField(_ value: String) -> String {
+        let flat = value.contains(where: { "\t\r\n".contains($0) })
+            ? value.components(separatedBy: CharacterSet(charactersIn: "\t\r\n")).joined(separator: " ")
+            : value
+        if let first = flat.first, "=+-@".contains(first) { return "'" + flat }
+        return flat
     }
 
     // MARK: - Open With, Copy To, Move To
@@ -997,7 +1040,10 @@ final class SearchModel {
     /// being overwritten. Files inside archives are skipped: they have no file of their own.
     func transfer(_ ids: Set<FileHit.ID>? = nil, _ kind: Transfer) async {
         var seen = Set<URL>()
-        let sources = hits(ids).filter { !$0.isArchiveEntry }.map(\.url).filter { seen.insert($0).inserted }
+        var sources = hits(ids).filter { !$0.isArchiveEntry }.map(\.url).filter { seen.insert($0).inserted }
+        // A folder carries its contents, so a selected item inside a selected folder goes with
+        // the folder rather than being copied twice or pulled out by its own move.
+        sources = Self.withoutNestedSources(sources)
         guard !sources.isEmpty else {
             NSSound.beep()
             return
@@ -1020,7 +1066,7 @@ final class SearchModel {
         }
         guard !outcome.failed.isEmpty else { return }
         let refused = sources.filter { outcome.done[$0] == nil }
-        if outcome.deniedByPermissions {
+        if outcome.deniedByPermissions, !Self.hasFullDiskAccess() {
             explainPermission(toDo: kind.verb, refused, failures: outcome.failed)
         } else {
             let alert = NSAlert()
@@ -1036,8 +1082,11 @@ final class SearchModel {
         for source in sources {
             // A folder copied into itself keeps finding the copy it is writing and copies that
             // too, about a hundred levels deep, until the path is too long — and the partial
-            // copies stay behind. Finder refuses it, and so does this.
-            let resolved = source.resolvingSymlinksInPath().path
+            // copies stay behind. Finder refuses it, and so does this. Only the parent is
+            // resolved: the operation acts on a symlink itself, so resolving the link too made a
+            // link to a folder read as that folder, and copying the link there was refused.
+            let resolved = source.deletingLastPathComponent().resolvingSymlinksInPath()
+                .appending(path: source.lastPathComponent).path
             if destination == resolved || destination.hasPrefix(resolved + "/") {
                 outcome.failed.append("\(source.lastPathComponent): A folder can’t be \(kind == .copy ? "copied" : "moved") into itself.")
                 continue
@@ -1048,7 +1097,10 @@ final class SearchModel {
                 outcome.done[source] = source
                 continue
             }
-            let target = availableName(for: source.lastPathComponent, in: folder)
+            let values = try? source.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
+            let target = availableName(
+                for: source.lastPathComponent, in: folder,
+                isFolder: values?.isDirectory == true && values?.isPackage != true)
             do {
                 switch kind {
                 case .copy: try FileManager.default.copyItem(at: source, to: target)
@@ -1056,7 +1108,13 @@ final class SearchModel {
                 }
                 outcome.done[source] = target
             } catch {
-                let refusal = failure(error, of: source)
+                // `copyItem` stops at its first unreadable file and keeps what it copied; swept
+                // up, a retry starts clean instead of landing beside the remnant as "Album 2".
+                // `availableName` says the target did not exist before, so only ours is removed.
+                if kind == .copy { try? FileManager.default.removeItem(at: target) }
+                // A lock on the source refuses a move, but copying a locked file is fine, so a
+                // copy's failure must not be blamed on the lock.
+                let refusal = failure(error, of: source, lockMatters: kind == .move)
                 outcome.failed.append(refusal.line)
                 if refusal.needsAccess { outcome.deniedByPermissions = true }
             }
@@ -1064,10 +1122,11 @@ final class SearchModel {
         return outcome
     }
 
-    /// "Report.pdf", then "Report 2.pdf", "Report 3.pdf" — Finder's convention.
-    nonisolated static func availableName(for name: String, in folder: URL) -> URL {
-        let base = (name as NSString).deletingPathExtension
-        let ext = (name as NSString).pathExtension
+    /// "Report.pdf", then "Report 2.pdf", "Report 3.pdf" — Finder's convention. A folder's name
+    /// is all name, as Rename treats it: a clash on "v1.0" becomes "v1.0 2", not "v1 2.0".
+    nonisolated static func availableName(for name: String, in folder: URL, isFolder: Bool = false) -> URL {
+        let base = isFolder ? name : (name as NSString).deletingPathExtension
+        let ext = isFolder ? "" : (name as NSString).pathExtension
         var candidate = folder.appending(path: name)
         var number = 2
         while FileManager.default.fileExists(atPath: candidate.path) {
@@ -1106,7 +1165,7 @@ final class SearchModel {
         guard !outcome.failed.isEmpty else { return }
         // Where each file is now: the batch is undone, bar any file the alert says ended elsewhere.
         let items = steps.map { outcome.done[$0.source] ?? $0.source }
-        if outcome.deniedByPermissions {
+        if outcome.deniedByPermissions, !Self.hasFullDiskAccess() {
             explainPermission(toDo: "rename", items, failures: outcome.failed)
         } else {
             let alert = NSAlert()
@@ -1121,6 +1180,7 @@ final class SearchModel {
     /// under its new ID.
     func relocateRows(after outcome: TransferOutcome) {
         let renamed = Dictionary(uniqueKeysWithValues: outcome.done.map { ($0.key.path, $0.value.path) })
+        recordWalkRelocations(renamed)
         let before = results
         results = Self.relocate(results, renamed)
         let newIDs = Dictionary(zip(before.map(\.id), results.map(\.id))) { first, _ in first }
@@ -1151,22 +1211,63 @@ final class SearchModel {
     private static func relocate(_ hits: [FileHit], _ renamed: [String: String]) -> [FileHit] {
         hits.map { hit in
             let path = hit.url.path
-            var ancestor = path
-            while !ancestor.isEmpty, ancestor != "/" {
-                if let moved = renamed[ancestor] {
-                    let url = URL(
-                        filePath: moved + (path as NSString).substring(from: (ancestor as NSString).length),
-                        directoryHint: hit.url.hasDirectoryPath ? .isDirectory : .notDirectory)
-                    let isOwnRow = ancestor == path && !hit.isArchiveEntry
-                    return FileHit(
-                        url: url, archiveEntry: hit.archiveEntry, name: isOwnRow ? url.lastPathComponent : hit.name,
-                        isFolder: hit.isFolder, size: hit.size, modified: hit.modified, created: hit.created,
-                        kind: hit.kind, snippet: hit.snippet)
-                }
-                ancestor = (ancestor as NSString).deletingLastPathComponent
-            }
-            return hit
+            guard let moved = relocatedPath(path, renamed) else { return hit }
+            let url = URL(
+                filePath: moved,
+                directoryHint: hit.url.hasDirectoryPath ? .isDirectory : .notDirectory)
+            let isOwnRow = renamed[path] != nil && !hit.isArchiveEntry
+            return FileHit(
+                url: url, archiveEntry: hit.archiveEntry, name: isOwnRow ? url.lastPathComponent : hit.name,
+                isFolder: hit.isFolder, size: hit.size, modified: hit.modified, created: hit.created,
+                kind: hit.kind, snippet: hit.snippet)
         }
+    }
+
+    /// Folds a batch of renames into `walkRelocations` while a walk is running, keeping chains
+    /// collapsed: renamed A to B and then B to C mid-walk, a straggler found under A must land
+    /// under C in one step.
+    private func recordWalkRelocations(_ renamed: [String: String]) {
+        guard isSearching else { return }
+        for (old, current) in walkRelocations {
+            walkRelocations[old] = Self.relocatedPath(current, renamed) ?? current
+        }
+        for (old, new) in renamed where walkRelocations[old] == nil {
+            walkRelocations[old] = new
+        }
+    }
+
+    /// `path` after the renames in `renamed` — its own, or a renamed ancestor's rewritten part —
+    /// or nil when no rename covers it.
+    private static func relocatedPath(_ path: String, _ renamed: [String: String]) -> String? {
+        var ancestor = path
+        while !ancestor.isEmpty, ancestor != "/" {
+            if let moved = renamed[ancestor] {
+                return moved + (path as NSString).substring(from: (ancestor as NSString).length)
+            }
+            ancestor = (ancestor as NSString).deletingLastPathComponent
+        }
+        return nil
+    }
+
+    /// Whether `path` or any of its ancestors is in `paths`: one set lookup per level, as
+    /// `relocate` walks.
+    private static func isUnder(_ path: String, _ paths: Set<String>) -> Bool {
+        var path = path
+        while !path.isEmpty, path != "/" {
+            if paths.contains(path) { return true }
+            path = (path as NSString).deletingLastPathComponent
+        }
+        return false
+    }
+
+    /// Sources with an ancestor also among the sources are covered by that ancestor. Processed on
+    /// their own, in display order, a selected folder and a selected item inside it made the
+    /// result depend on the sort: the item was pulled out of its folder, or its move failed with
+    /// an alert, or a copy landed twice.
+    static func withoutNestedSources(_ sources: [URL]) -> [URL] {
+        guard sources.count > 1 else { return sources }
+        let paths = Set(sources.map(\.path))
+        return sources.filter { !isUnder(($0.path as NSString).deletingLastPathComponent, paths) }
     }
 
     /// Every file is parked under a temporary name before any lands under its new one, so a batch
@@ -1241,7 +1342,10 @@ final class SearchModel {
             do {
                 try manager.moveItem(at: holding, to: step.source)
             } catch {
-                let fallback = availableName(for: name, in: folder)
+                let values = try? holding.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
+                let fallback = availableName(
+                    for: name, in: folder,
+                    isFolder: values?.isDirectory == true && values?.isPackage != true)
                 do {
                     try manager.moveItem(at: holding, to: fallback)
                     outcome.done[step.source] = fallback
@@ -1299,6 +1403,9 @@ final class SearchModel {
             let present = Set(current.map(\.id))
             let sets = found.sets.map { $0.filter(present.contains) }.filter { $0.count > 1 }
             guard !sets.isEmpty else {
+                // Not under XCTest: the panel really displays wherever the tests run, nobody is
+                // there to dismiss it, and the whole suite sits behind it.
+                guard !Self.isRunningTests else { return }
                 let alert = NSAlert()
                 alert.messageText = "No duplicates"
                 alert.informativeText = "None of these \((candidates.count - found.unread).formatted()) files have the same contents as another."
@@ -1396,6 +1503,9 @@ final class SearchModel {
     private static func describe(_ urls: [URL]) -> String {
         urls.count == 1 ? "“\(urls[0].lastPathComponent)”" : "\(urls.count) items"
     }
+
+    /// Whether this process is `swift test`'s host, where a modal alert must not be shown.
+    nonisolated static let isRunningTests = NSClassFromString("XCTestCase") != nil
 
     // MARK: - Persistence
 

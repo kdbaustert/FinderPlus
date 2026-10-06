@@ -145,6 +145,38 @@ final class QueryMatcherTests: XCTestCase {
         XCTAssertEqual(found, ["a to z"])
         XCTAssertEqual(m.ranges(in: "azure sky\nno match here"), [])
     }
+
+    // ICU backtracks exponentially on patterns like (a+)+$, and `rangeOfFirstMatch` cannot be
+    // interrupted — not even by Stop — so a guarded match gives up within its budget instead of
+    // holding the thread for hours.
+    func testARunawayRegexGivesUpInsideItsBudget() throws {
+        let m = try matcher("(a+)+$") { $0.mode = .regex }
+        let started = ContinuousClock.now
+        XCTAssertFalse(m.matches(String(repeating: "a", count: 40) + "!"))
+        XCTAssertLessThan(started.duration(to: .now), .seconds(10))
+        XCTAssertTrue(m.matches(String(repeating: "a", count: 40)), "a real match is still found")
+        XCTAssertEqual(m.ranges(in: "xaaa").count, 1, "ranges stay guarded and still report matches")
+    }
+
+    // `^` and `$` used to anchor to the whole file, so `^import` missed every line but the first.
+    func testRegexAnchorsMatchLines() throws {
+        let m = try matcher("^import") { $0.mode = .regex }
+        XCTAssertTrue(m.matches("let x = 1\nimport Foundation"))
+        XCTAssertFalse(m.matches("do not import this"))
+    }
+
+    // Folding "ಬೇ" grows by a mark while a decomposed "é" shrinks by one, so the total length is
+    // unchanged and the old equal-length shortcut trusted offsets that were two units off: the
+    // highlight read "nvoice ".
+    func testHighlightsStayPutAfterALengtheningVowelSign() throws {
+        let text = "ಬೇಕು invoice cafe\u{301}"
+        let m = try matcher("invoice", anchors: false)
+        let expected = (text as NSString).range(of: "invoice")
+        XCTAssertEqual(m.ranges(in: text), [expected])
+        XCTAssertEqual(m.ranges(in: text).map { (text as NSString).substring(with: $0) }, ["invoice"])
+        let snippet = try XCTUnwrap(m.snippet(in: text))
+        XCTAssertEqual((snippet.text as NSString).substring(with: snippet.match), "invoice")
+    }
 }
 
 final class SearchLocationTests: XCTestCase {
@@ -676,6 +708,48 @@ final class AuditFixTests: XCTestCase {
         XCTAssertEqual(SearchEngine.decode(Data([0x63, 0x61, 0x66, 0xE9, 0x20, 0x92, 0x73])), "café ’s")
     }
 
+    // UTF-8 got that lossy fallback; UTF-16 had none, so one lone surrogate made a whole file
+    // unsearchable.
+    func testUTF16WithALoneSurrogateStillReads() {
+        var data = Data([0xFF, 0xFE])
+        data += "ok ".data(using: .utf16LittleEndian)!
+        data += Data([0x00, 0xD8])  // a high surrogate with no partner
+        data += " go".data(using: .utf16LittleEndian)!
+        XCTAssertEqual(SearchEngine.decode(data), "ok \u{FFFD} go")
+    }
+
+    // `.ts` declares an MPEG-2 type and `.mts` AVCHD, so excluding "Video" hid TypeScript files
+    // from name searches too, and their Kind read "MPEG-2 transport stream".
+    func testVideoExclusionDoesNotHideTypeScript() throws {
+        _ = try write("config.ts", "export const x = 1")
+        _ = try write("config.mts", "export const x = 1")
+        _ = try write("clip.mp4", "not really a video")
+        let hits = try walk("c") { $0.excludedKinds = [.video] }
+        XCTAssertEqual(hits.map(\.name), ["config.mts", "config.ts"])
+        XCTAssertEqual(hits.map(\.kind), ["MTS File", "TS File"])
+    }
+
+    // A file the search could not open looked exactly like a file that does not contain the words:
+    // found nothing, counted nothing.
+    func testUnreadableFilesAreCountedNotSilentlySkipped() throws {
+        _ = try write("open.txt", "the needle is here")
+        let locked = try write("locked.txt", "the needle is here")
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: locked.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: locked.path) }
+        var options = SearchOptions()
+        options.searchNames = false
+        options.searchContents = true
+        let request = try SearchRequest(roots: [root], query: "needle", options: options)
+        var names: [String] = []
+        var unreadable = 0
+        SearchEngine.walk(request) { event in
+            if case .hits(let batch) = event { names += batch.map(\.name) }
+            if case .progress(_, _, let count) = event { unreadable = max(unreadable, count) }
+        }
+        XCTAssertEqual(names, ["open.txt"])
+        XCTAssertGreaterThanOrEqual(unreadable, 1)
+    }
+
     func testMarkupDecodesNumericAndNamedEntities() {
         XCTAssertEqual(
             DocumentText.markupText("<p>caf&eacute; &#233;t&#xE9; don&rsquo;t &amp;lt; &bogus; &yuml;&iexcl;</p>"),
@@ -829,8 +903,14 @@ final class DocumentTextTests: XCTestCase {
         XCTAssertTrue(text.contains("Quarterly revenue"), text)
         XCTAssertTrue(text.contains("4242"))
 
-        let pptx = try makeZip("deck.pptx", ["ppt/slides/slide1.xml": "<p:sld><a:t>Launch</a:t><a:t>plan</a:t></p:sld>"])
-        XCTAssertTrue(try XCTUnwrap(SearchEngine.contentText(of: pptx, size: 1)).contains("Launch plan"))
+        // Runs inside one paragraph fuse, as PowerPoint renders them; paragraphs stay apart. The
+        // old expectation here ("Launch plan" from two bare <a:t> runs) enshrined the splitting.
+        let pptx = try makeZip("deck.pptx", ["ppt/slides/slide1.xml":
+            "<p:sld><a:p><a:r><a:t>Quar</a:t></a:r><a:r><a:t>terly</a:t></a:r></a:p><a:p><a:r><a:t>plan</a:t></a:r></a:p></p:sld>"])
+        let slide = try XCTUnwrap(SearchEngine.contentText(of: pptx, size: 1))
+        XCTAssertTrue(slide.contains("Quarterly"), slide)
+        XCTAssertTrue(slide.contains(" plan"), slide)
+        XCTAssertFalse(slide.contains("terlyplan"), slide)
 
         let epub = try makeZip("book.epub", ["OEBPS/chapter1.xhtml": "<html><body><p>Call me Ishmael.</p></body></html>"])
         XCTAssertTrue(try XCTUnwrap(SearchEngine.contentText(of: epub, size: 1)).contains("Call me Ishmael."))
@@ -843,6 +923,65 @@ final class DocumentTextTests: XCTestCase {
         let text = try XCTUnwrap(SearchEngine.contentText(of: page, size: 100))
         XCTAssertTrue(text.contains("Welcome home page"), text)
         XCTAssertFalse(text.contains("<h1>"))
+    }
+
+    // `unzip` expanded `[`, `?` and `*` in the archive's own file name, so "Q[1].xlsx" was read
+    // as its sibling "Q1.xlsx": the glob file's text was never searched, and its hit and preview
+    // showed the other file's.
+    func testZipTextReadsTheNamedArchiveNotAGlobSibling() throws {
+        _ = try makeZip("Q1.xlsx", ["xl/sharedStrings.xml": "<sst><si><t>ALPHA</t></si></sst>"])
+        let bracketed = try makeZip("Q[1].xlsx", ["xl/sharedStrings.xml": "<sst><si><t>BRAVO</t></si></sst>"])
+        let text = try XCTUnwrap(SearchEngine.contentText(of: bracketed, size: 1))
+        XCTAssertTrue(text.contains("BRAVO"), text)
+        XCTAssertFalse(text.contains("ALPHA"), text)
+    }
+
+    // A t="s" cell's <v> is an index into sharedStrings, not a value: left in, a content search
+    // for "17" matched every workbook with that many unique strings.
+    func testSharedStringIndicesAreNotSearchableText() throws {
+        let xlsx = try makeZip("indices.xlsx", [
+            "xl/sharedStrings.xml": "<sst><si><t>apple</t></si><si><t>banana</t></si></sst>",
+            "xl/worksheets/sheet1.xml":
+                "<sheetData><row><c r=\"A1\" t=\"s\"><v>17</v></c><c r=\"B1\"><v>4242</v></c></row></sheetData>",
+        ])
+        let text = try XCTUnwrap(SearchEngine.contentText(of: xlsx, size: 1))
+        XCTAssertTrue(text.contains("apple"), text)
+        XCTAssertTrue(text.contains("4242"), text)
+        XCTAssertFalse(text.contains("17"), text)
+    }
+
+    // Every tag used to become a space, splitting words the markup only styles: a drop-cap span,
+    // a word split across runs, a soft hyphen.
+    func testInlineTagsDoNotSplitWords() {
+        XCTAssertEqual(DocumentText.markupText("<p><span class=\"dropcap\">Q</span>uarterly results</p>"),
+                       " Quarterly results ")
+        XCTAssertEqual(DocumentText.markupText("<si><r><rPr/><t>Quar</t></r><r><t>terly</t></r></si>"),
+                       " Quarterly ")
+        XCTAssertEqual(DocumentText.markupText("<p>one</p><p>two</p>"), " one two ")
+        XCTAssertEqual(DocumentText.markupText("<td>a</td><td>b</td>"), " a b ")
+        XCTAssertEqual(DocumentText.markupText("Quar&shy;terly"), "Quarterly")
+        XCTAssertEqual(DocumentText.markupText("Quar\u{AD}terly"), "Quarterly")
+    }
+
+    // With no document type given, AppKit sniffed an HTML ".doc" (a common web-app export) and
+    // handed it to WebKit, which waited out a 63-second load timeout on any remote image — one
+    // such file froze its whole content batch — and then returned the raw tags.
+    func testAnHTMLFileWearingADocExtensionReadsAsTextQuickly() throws {
+        let doc = root.appending(path: "report.doc")
+        try """
+            <!DOCTYPE html><html><head><img src="https://example.invalid/logo.png"></head>\
+            <body><p>Quarterly figures attached</p></body></html>
+            """.write(to: doc, atomically: true, encoding: .utf8)
+        let started = ContinuousClock.now
+        let text = try XCTUnwrap(SearchEngine.contentText(of: doc, size: 200))
+        XCTAssertLessThan(started.duration(to: .now), .seconds(5))
+        XCTAssertTrue(text.contains("Quarterly figures attached"), text)
+        XCTAssertFalse(text.contains("<p>"), text)
+
+        // A real rich-text document still parses through its own reader.
+        let rtf = root.appending(path: "note.rtf")
+        try #"{\rtf1\ansi Hello from RTF}"#.write(to: rtf, atomically: true, encoding: .utf8)
+        XCTAssertTrue(try XCTUnwrap(SearchEngine.contentText(of: rtf, size: 100)).contains("Hello from RTF"))
     }
 
     func testTextIsRecognisedInAnImage() throws {
@@ -998,6 +1137,110 @@ final class ResultActionTests: XCTestCase {
         let moved = SearchModel.perform(.move, [source], into: folder)
         XCTAssertEqual(moved.done[source]?.lastPathComponent, "Report 3.pdf")
         XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
+    }
+
+    // Copy Rows pasted raw text, so a "=HYPERLINK(…)" name ran as a formula in Excel and a tab in
+    // a name shifted every cell after it.
+    func testCopyRowsFieldsAreNeutralised() {
+        XCTAssertEqual(SearchModel.tsvField("=HYPERLINK(\"x\")"), "'=HYPERLINK(\"x\")")
+        XCTAssertEqual(SearchModel.tsvField("a\tb\nc"), "a b c")
+        XCTAssertEqual(SearchModel.tsvField("-draft"), "'-draft")
+        XCTAssertEqual(SearchModel.tsvField("report.pdf"), "report.pdf")
+    }
+
+    // `availableName` split a folder's name at its dot, proposing "v1 2.0" for a clash on "v1.0".
+    func testAvailableNameTreatsAFolderNameWhole() throws {
+        try FileManager.default.createDirectory(at: root.appending(path: "v1.0"), withIntermediateDirectories: true)
+        XCTAssertEqual(SearchModel.availableName(for: "v1.0", in: root, isFolder: true).lastPathComponent, "v1.0 2")
+        _ = try write("Report.pdf", "x")
+        XCTAssertEqual(SearchModel.availableName(for: "Report.pdf", in: root).lastPathComponent, "Report 2.pdf")
+    }
+
+    // A folder and an item inside it both selected (⌘A does this): processed separately, in
+    // display order, the item was pulled out of its folder, or its move failed with an alert, or
+    // a copy landed twice.
+    func testNestedSelectionsTransferAsOneFolder() throws {
+        let track = try write("album/track.mp3", "x")
+        let folder = track.deletingLastPathComponent()
+        let loose = try write("loose.txt", "x")
+        XCTAssertEqual(SearchModel.withoutNestedSources([folder, track, loose]), [folder, loose])
+        XCTAssertEqual(SearchModel.withoutNestedSources([track]), [track])
+
+        let destination = root.appending(path: "dest")
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let outcome = SearchModel.perform(
+            .copy, SearchModel.withoutNestedSources([track, folder]), into: destination)
+        XCTAssertEqual(outcome.failed, [])
+        XCTAssertEqual(try FileManager.default.subpathsOfDirectory(atPath: destination.path).sorted(),
+                       ["album", "album/track.mp3"])
+    }
+
+    // The containment check resolved the symlink itself, refusing to copy a link into the folder
+    // it points at — though the operation copies the link file, which recurses into nothing.
+    func testASymlinkToAFolderCopiesIntoThatFolder() throws {
+        let folder = root.appending(path: "target")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let link = root.appending(path: "shortcut")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: folder)
+        let outcome = SearchModel.perform(.copy, [link], into: folder)
+        XCTAssertEqual(outcome.failed, [])
+        XCTAssertEqual(outcome.done[link]?.lastPathComponent, "shortcut")
+        // A real folder into itself is still refused.
+        XCTAssertTrue(SearchModel.perform(.copy, [folder], into: folder).failed.first?.contains("into itself") == true)
+    }
+
+    // A failed folder copy kept what it had copied: the alert said nothing, and a retry landed
+    // beside the remnant as "Album 2".
+    func testAFailedFolderCopyLeavesNoPartialCopyBehind() throws {
+        let album = try write("Album/one.txt", "x").deletingLastPathComponent()
+        let sealed = try write("Album/sealed.txt", "x")
+        _ = try write("Album/two.txt", "x")
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: sealed.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: sealed.path) }
+        let destination = root.appending(path: "dest")
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+
+        let outcome = SearchModel.perform(.copy, [album], into: destination)
+        XCTAssertEqual(outcome.failed.count, 1)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: destination.path), [],
+                       "the partial copy must be swept up")
+        // And with the sealed file the only failure, the retry can land under the plain name.
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: sealed.path)
+        XCTAssertEqual(SearchModel.perform(.copy, [album], into: destination).done[album]?.lastPathComponent, "Album")
+    }
+
+    // A rename mid-walk used to leave ghost rows: hits the enumerator and the pending buffer were
+    // already holding arrived under the old path, and `insertSorted` accepted them as new rows
+    // nothing on disk answers to (4,252 of 30,000 in the probe that found this).
+    func testRenamingAFolderMidWalkLeavesNoGhostRows() async throws {
+        let folder = root.appending(path: "proj")
+        for sub in 0..<40 {
+            let dir = folder.appending(path: "sub\(sub)")
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            for index in 0..<400 {
+                try Data("x".utf8).write(to: dir.appending(path: "file\(index).txt"))
+            }
+        }
+        let model = SearchModel(defaults: defaults)
+        model.locationID = root.path
+        model.query = "file"
+        model.start()
+        for _ in 0..<2_000 where model.results.count < 500 && model.isSearching {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        // The rows carry the walk's canonical paths (/private/var, not /var), and real rename
+        // steps are built from rows — so the step must use that spelling too, or nothing matches.
+        let walked = URL(filePath: SearchEngine.walkedPath(of: folder), directoryHint: .isDirectory)
+        let outcome = SearchModel.performRename(
+            [RenameStep(source: walked, target: walked.deletingLastPathComponent().appending(path: "renamed"))])
+        XCTAssertEqual(outcome.failed, [])
+        model.relocateRows(after: outcome)
+        try await finish(model)
+
+        let ghosts = model.results.filter { $0.url.path.contains("/proj/") }
+        XCTAssertEqual(ghosts.count, 0, "rows under the old path: \(ghosts.prefix(3).map(\.url.path))")
+        XCTAssertTrue(model.results.allSatisfy { FileManager.default.fileExists(atPath: $0.url.path) },
+                      "every row must answer to a file on disk")
     }
 
     func testDuplicatesAreGroupedAndTheFullListComesBack() async throws {
@@ -1213,8 +1456,8 @@ final class ResultActionTests: XCTestCase {
         XCTAssertEqual(model.results.count, 2)
 
         try "diff bytes".write(to: copy, atomically: true, encoding: .utf8)
-        // The "No duplicates" alert is modal; the test host has no window to show it in, so it
-        // returns at once.
+        // The "No duplicates" alert is skipped under XCTest: the modal panel really displays on
+        // whatever screen runs the tests, and the suite would sit behind it until someone clicked.
         model.findDuplicates()
         try await finish(model)
         XCTAssertTrue(model.showsDuplicates)
@@ -1403,6 +1646,8 @@ final class BatchRenameTests: XCTestCase {
 
     func testProblemsCatchUnusableNames() {
         XCTAssertNotNil(BatchRename.problem(with: ""))
+        // Replace Text can empty the stem: "IMG.jpg" minus "IMG" plans ".jpg", a hidden file.
+        XCTAssertNotNil(BatchRename.problem(with: ".jpg"))
         XCTAssertNotNil(BatchRename.problem(with: "a/b"))
         XCTAssertNotNil(BatchRename.problem(with: "a:b"))
         XCTAssertNotNil(BatchRename.problem(with: ".."))

@@ -102,6 +102,9 @@ enum BatchRename {
     static func problem(with name: String) -> String? {
         if name.isEmpty { return "The name is empty" }
         if name == "." || name == ".." { return "That name is reserved" }
+        // Replace Text can empty the stem ("IMG.jpg" minus "IMG" plans ".jpg"), and the file
+        // would vanish from Finder and from the next search.
+        if name.hasPrefix(".") { return "A name starting with “.” would hide the file" }
         if name.contains("/") || name.contains(":") { return "Names can’t contain “/” or “:”" }
         if name.utf8.count > 255 { return "That name is too long" }
         return nil
