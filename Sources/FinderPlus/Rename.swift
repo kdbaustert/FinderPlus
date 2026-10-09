@@ -98,13 +98,14 @@ enum BatchRename {
         }
     }
 
-    /// Why a proposed name can never be used, or nil for a usable one.
-    static func problem(with name: String) -> String? {
+    /// Why a proposed name can never be used, or nil for a usable one. `wasHidden` is for a file
+    /// that already starts with a dot, which keeps hiding under any name that does too.
+    static func problem(with name: String, wasHidden: Bool = false) -> String? {
         if name.isEmpty { return "The name is empty" }
         if name == "." || name == ".." { return "That name is reserved" }
         // Replace Text can empty the stem ("IMG.jpg" minus "IMG" plans ".jpg"), and the file
-        // would vanish from Finder and from the next search.
-        if name.hasPrefix(".") { return "A name starting with “.” would hide the file" }
+        // would vanish from Finder and from the next search. A file already hidden loses nothing.
+        if name.hasPrefix("."), !wasHidden { return "A name starting with “.” would hide the file" }
         if name.contains("/") || name.contains(":") { return "Names can’t contain “/” or “:”" }
         if name.utf8.count > 255 { return "That name is too long" }
         return nil
@@ -146,7 +147,7 @@ enum BatchRename {
         }
         return names.map { hit, name in
             guard name != hit.name else { return PlannedName(hit: hit, name: name, problem: nil) }
-            var problem = Self.problem(with: name)
+            var problem = Self.problem(with: name, wasHidden: hit.name.hasPrefix("."))
             if problem == nil {
                 let target = hit.url.deletingLastPathComponent().appending(path: name).path
                 if counts[target.lowercased(), default: 0] > 1 {

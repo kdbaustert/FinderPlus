@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 enum QueryError: LocalizedError {
     case empty
@@ -35,48 +36,131 @@ struct QueryMatcher: @unchecked Sendable {
         var quoted = false
     }
 
-    private enum Pattern {
-        /// `guarded` for a pattern the user wrote in Regular Expression mode, whose backtracking
-        /// can run away; literal and wildcard patterns are escaped, never nest quantifiers, and
-        /// skip the guard's overhead.
-        case regex(NSRegularExpression, guarded: Bool)
-        /// An unanchored wildcard with a `*` between pieces, such as `a*z`.
-        case pieces([NSRegularExpression])
-        case fuzzy(FuzzyPattern)
+    /// What one runaway-prone pattern has cost a search so far. A class, shared by every worker
+    /// thread through the matcher's copies.
+    ///
+    /// ICU backtracks exponentially on patterns like `(a+)+$`, so a pattern the user wrote in
+    /// Regular Expression mode gets a time budget per text. The budget alone is not enough: over
+    /// ten thousand names it would still cost two seconds each, hours in all. A pattern that has
+    /// timed out on `giveUpAfter` short texts — where a sound pattern finishes in microseconds —
+    /// is the runaway kind, and the rest of the search counts its texts as timed out without
+    /// trying them.
+    final class RegexGuard: Sendable {
+        private struct State { var timeouts = 0, shortTimeouts = 0 }
+        private let state = OSAllocatedUnfairLock(initialState: State())
+        private let base: Duration
 
-        func find(in text: String) -> NSRange? {
-            switch self {
-            case .regex(let regex, let guarded):
-                let whole = NSRange(location: 0, length: (text as NSString).length)
-                if guarded { return Self.guardedFirstMatch(regex, in: text, range: whole) }
-                let range = regex.rangeOfFirstMatch(in: text, range: whole)
-                return range.location == NSNotFound ? nil : range
-            case .pieces(let pieces):
-                return Self.find(pieces, in: text, from: 0)
-            case .fuzzy(let pattern):
-                return pattern.find(in: text)
+        init(base: Duration = .seconds(2)) {
+            self.base = base
+        }
+
+        /// Texts under this many UTF-16 units are short: a sound pattern cannot take seconds on one.
+        /// Low enough that a minified file with `.*a.*b.*c` in it, which can legitimately take
+        /// over two seconds at 50,000 units, does not count toward giving the pattern up.
+        static let shortText = 20_000
+        static let giveUpAfter = 3
+
+        /// Texts that timed out, or were not tried because the pattern had been given up on.
+        var timeouts: Int { state.withLock { $0.timeouts } }
+        var isGivenUp: Bool { state.withLock { $0.shortTimeouts >= Self.giveUpAfter } }
+
+        /// Two seconds, plus one more for every 5 million units. A fixed two seconds timed out a
+        /// sound pattern over a 50 MB log, which took 1.4 to 1.7 seconds here on a fast Mac: this
+        /// allows 12 seconds there, and still cuts a runaway off in about two on a short text.
+        func budget(forLength length: Int) -> Duration {
+            base + .milliseconds(length / 5_000)
+        }
+
+        func recordTimeout(length: Int) {
+            state.withLock {
+                $0.timeouts += 1
+                if length < Self.shortText { $0.shortTimeouts += 1 }
             }
         }
 
-        /// How long one runaway pattern may hold one text before it is treated as not matching.
-        /// ICU backtracks exponentially on patterns like `(a+)+$`, and `rangeOfFirstMatch` cannot
-        /// be interrupted — not even by Stop — so a guarded match goes through
-        /// `enumerateMatches`, whose `.reportProgress` calls back mid-match.
-        static let matchBudget: Duration = .seconds(2)
+        func recordSkipped() {
+            state.withLock { $0.timeouts += 1 }
+        }
+    }
 
-        static func guardedFirstMatch(_ regex: NSRegularExpression, in text: String, range: NSRange) -> NSRange? {
-            let deadline = ContinuousClock.now + matchBudget
+    /// A required pattern that times out is not a match; an excluded one that times out excludes,
+    /// since keeping a file the search could not check would put it in the results as if it passed.
+    private enum Outcome {
+        case found(NSRange)
+        case missing
+        case timedOut
+    }
+
+    private enum Pattern {
+        /// `guardian` for a pattern the user wrote in Regular Expression mode, whose backtracking
+        /// can run away; literal and wildcard patterns are escaped, never nest quantifiers, and
+        /// skip the guard's overhead.
+        case regex(NSRegularExpression, guardian: RegexGuard?)
+        /// An unanchored wildcard with a `*` between pieces, such as `a*z`.
+        case pieces([NSRegularExpression])
+        /// An anchored wildcard with a `*` between pieces, such as `*a*b*.pdf`, matched piece by
+        /// piece: as one regex, `^.*a.*b.*\.pdf$` backtracks polynomially in the name's length,
+        /// and six stars on a 184-character name ran past two minutes. The first piece carries
+        /// `\A` and the last `\z` unless the wildcard starts or ends with a `*`.
+        case wholeName([NSRegularExpression])
+        case fuzzy(FuzzyPattern)
+
+        func find(in text: String) -> Outcome {
+            switch self {
+            case .regex(let regex, let guardian):
+                let whole = NSRange(location: 0, length: (text as NSString).length)
+                if let guardian { return Self.guardedFirstMatch(regex, guardian, in: text, range: whole) }
+                let range = regex.rangeOfFirstMatch(in: text, range: whole)
+                return range.location == NSNotFound ? .missing : .found(range)
+            case .pieces(let pieces):
+                return Self.find(pieces, in: text, from: 0).map(Outcome.found) ?? .missing
+            case .wholeName(let pieces):
+                return Self.findWholeName(pieces, in: text).map(Outcome.found) ?? .missing
+            case .fuzzy(let pattern):
+                return pattern.find(in: text).map(Outcome.found) ?? .missing
+            }
+        }
+
+        /// `rangeOfFirstMatch` cannot be interrupted — not even by Stop — so a guarded match goes
+        /// through `enumerateMatches`, whose `.reportProgress` calls back mid-match.
+        static func guardedFirstMatch(
+            _ regex: NSRegularExpression, _ guardian: RegexGuard, in text: String, range: NSRange
+        ) -> Outcome {
+            if guardian.isGivenUp {
+                guardian.recordSkipped()
+                return .timedOut
+            }
+            let deadline = ContinuousClock.now + guardian.budget(forLength: range.length)
             var found: NSRange?
+            var timedOut = false
             regex.enumerateMatches(in: text, options: .reportProgress, range: range) { match, _, stop in
                 if let match {
                     found = match.range
                     stop.pointee = true
                 } else if ContinuousClock.now >= deadline {
+                    timedOut = true
                     stop.pointee = true
                 }
             }
-            guard let found, found.location != NSNotFound else { return nil }
-            return found
+            if let found, found.location != NSNotFound { return .found(found) }
+            if timedOut { guardian.recordTimeout(length: range.length) }
+            return timedOut ? .timedOut : .missing
+        }
+
+        /// The pieces in order, each the leftmost after the one before; the first and last carry
+        /// their own anchors. Fixed-length pieces, so leftmost is also earliest to end. A name
+        /// with a line break matches no wildcard, as `.` stops at one.
+        static func findWholeName(_ pieces: [NSRegularExpression], in text: String) -> NSRange? {
+            let string = text as NSString
+            guard string.rangeOfCharacter(from: .newlines).location == NSNotFound else { return nil }
+            var end = 0
+            for piece in pieces {
+                let range = piece.rangeOfFirstMatch(
+                    in: text, range: NSRange(location: end, length: string.length - end))
+                guard range.location != NSNotFound else { return nil }
+                end = NSMaxRange(range)
+            }
+            return NSRange(location: 0, length: string.length)
         }
 
         /// Each piece after the one before, all on one line — what `a.*z` means, since `.` stops at
@@ -118,16 +202,27 @@ struct QueryMatcher: @unchecked Sendable {
 
     private let clauses: [Clause]
     private let foldsDiacritics: Bool
+    private let guards: [RegexGuard]
+
+    /// How many texts a regular expression gave up on, for the search to report: a count of zero
+    /// means every text was really checked.
+    var timeouts: Int { guards.reduce(0) { $0 + $1.timeouts } }
 
     /// `anchorsWildcards`: a wildcard pattern such as `*.pdf` means a whole name, but a fragment of
     /// file contents or a comment. Terms without `*` or `?` are substring searches either way.
-    init(query: String, options: SearchOptions, anchorsWildcards: Bool = true) throws {
+    /// `timeBudget`: how long a Regular Expression pattern may hold one short text; see `RegexGuard`.
+    init(
+        query: String, options: SearchOptions, anchorsWildcards: Bool = true, timeBudget: Duration = .seconds(2)
+    ) throws {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw QueryError.empty }
-        foldsDiacritics = options.ignoreDiacritics
+        // Not in Regular Expression mode: folding the pattern rewrote it — `[À-ÿ]` became `[A-y]`,
+        // which matches "p", and `café` or `\p{Mn}` could never match the folded text. The text is
+        // matched as written (NFC) instead, and Ignore Case still applies.
+        foldsDiacritics = options.ignoreDiacritics && options.mode != .regex
         // NFC, as `subject(for:)` is: NSRegularExpression compares code points, so a composed "é"
         // would never find a decomposed one (e + combining accent). Folding already strips both.
-        let source = options.ignoreDiacritics ? Self.fold(trimmed) : trimmed.precomposedStringWithCanonicalMapping
+        let source = foldsDiacritics ? Self.fold(trimmed) : trimmed.precomposedStringWithCanonicalMapping
         // `anchorsMatchLines`, so `^` and `$` mean a line, as grep's do: against file contents a
         // whole-text anchor matches next to nothing, every other pattern is escaped and carries
         // no anchor, and `\A` and `\z` still mean the whole text.
@@ -135,6 +230,7 @@ struct QueryMatcher: @unchecked Sendable {
             options.ignoreCase ? [.caseInsensitive, .anchorsMatchLines] : [.anchorsMatchLines]
         // Only Regular Expression mode takes patterns whose backtracking can run away.
         let guarded = options.mode == .regex
+        var guards: [RegexGuard] = []
 
         func compile(_ full: String, reporting pattern: String) throws -> NSRegularExpression {
             do {
@@ -146,10 +242,28 @@ struct QueryMatcher: @unchecked Sendable {
         // Lookarounds rather than `\b`, which needs a word character beside it: with `\b`, "C++",
         // ".NET" and "#urgent" could never match, not even a file named exactly that.
         func regex(_ pattern: String, bounded: Bool = options.wholeWords) throws -> Pattern {
-            .regex(try compile(bounded ? "(?<!\\w)(?:\(pattern))(?!\\w)" : pattern, reporting: pattern), guarded: guarded)
+            let guardian = guarded ? RegexGuard(base: timeBudget) : nil
+            if let guardian { guards.append(guardian) }
+            return .regex(
+                try compile(bounded ? "(?<!\\w)(?:\(pattern))(?!\\w)" : pattern, reporting: pattern),
+                guardian: guardian)
         }
+        // Whitespace in a phrase matches any run of it, so a phrase found on one line is found
+        // across a line break too: PDFKit text has one at every wrap, and so do hard-wrapped
+        // .txt and .eml files.
         func exact(_ text: String) throws -> Pattern {
-            try regex(NSRegularExpression.escapedPattern(for: text))
+            var pattern = ""
+            var inSpace = false
+            for character in text {
+                if character.isWhitespace {
+                    if !inSpace { pattern += "\\s+" }
+                    inSpace = true
+                } else {
+                    inSpace = false
+                    pattern += NSRegularExpression.escapedPattern(for: String(character))
+                }
+            }
+            return try regex(pattern)
         }
         func literal(_ text: String) throws -> Pattern {
             if options.usesFuzzy {
@@ -160,15 +274,27 @@ struct QueryMatcher: @unchecked Sendable {
         func wildcard(_ text: String) throws -> Pattern {
             let anchored = anchorsWildcards && (text.contains("*") || text.contains("?"))
             let pieces = text.split(separator: "*").map { Self.wildcardPattern(String($0), anchored: false) }
-            if !anchored, pieces.count > 1 {
+            let (startsOpen, endsOpen) = (text.hasPrefix("*"), text.hasSuffix("*"))
+            if pieces.count > 1 {
                 let last = pieces.count - 1
+                if anchored {
+                    return .wholeName(try pieces.enumerated().map { index, piece in
+                        let before = index == 0 && !startsOpen ? "\\A" : ""
+                        let after = index == last && !endsOpen ? "\\z" : ""
+                        return try compile(before + "(?:\(piece))" + after, reporting: text)
+                    })
+                }
                 return .pieces(try pieces.enumerated().map { index, piece in
-                    let before = options.wholeWords && index == 0 ? "(?<!\\w)" : ""
-                    let after = options.wholeWords && index == last ? "(?!\\w)" : ""
+                    // An edge `*` is dropped by the split; with Whole Words it still lets the word
+                    // run on past the piece. Lazy at the start, or it runs to the last occurrence
+                    // of the piece in the word and `*foo*bar*` misses "foobarfoo".
+                    let before = options.wholeWords && index == 0 ? "(?<!\\w)" + (startsOpen ? "\\w*?" : "") : ""
+                    let after = options.wholeWords && index == last ? (endsOpen ? "\\w*" : "") + "(?!\\w)" : ""
                     return try compile(before + "(?:\(piece))" + after, reporting: text)
                 })
             }
-            return try regex(Self.wildcardPattern(text, anchored: anchored), bounded: options.wholeWords && !anchored)
+            let pattern = Self.wildcardPattern(text, anchored: anchored, wholeWords: options.wholeWords)
+            return try regex(pattern, bounded: options.wholeWords && !anchored)
         }
 
         var clauses: [Clause]
@@ -203,6 +329,7 @@ struct QueryMatcher: @unchecked Sendable {
         clauses.removeAll { $0.required.isEmpty }
         guard !clauses.isEmpty else { throw hadExclusions ? QueryError.onlyExclusions : QueryError.empty }
         self.clauses = clauses
+        self.guards = guards
     }
 
     /// Whether a name, tag or comment matches.
@@ -267,21 +394,32 @@ struct QueryMatcher: @unchecked Sendable {
         var found: [NSRange] = []
         for pattern in clauses.flatMap(\.required) {
             switch pattern {
-            case .regex(let regex, let guarded):
-                let deadline = ContinuousClock.now + Pattern.matchBudget
+            case .regex(let regex, let guardian):
+                if let guardian, guardian.isGivenUp {
+                    guardian.recordSkipped()
+                    continue
+                }
+                let deadline = ContinuousClock.now + (guardian?.budget(forLength: whole.length) ?? .zero)
+                var timedOut = false
                 regex.enumerateMatches(
-                    in: subject, options: guarded ? [.reportProgress] : [], range: whole
+                    in: subject, options: guardian == nil ? [] : [.reportProgress], range: whole
                 ) { match, _, stop in
                     if let match, match.range.length > 0 { found.append(match.range) }
                     if found.count >= limit { stop.pointee = true }
-                    if guarded, match == nil, ContinuousClock.now >= deadline { stop.pointee = true }
+                    if guardian != nil, match == nil, ContinuousClock.now >= deadline {
+                        timedOut = true
+                        stop.pointee = true
+                    }
                 }
+                if timedOut { guardian?.recordTimeout(length: whole.length) }
             case .pieces(let pieces):
                 var start = 0
                 while found.count < limit, let range = Pattern.find(pieces, in: subject, from: start) {
                     found.append(range)
                     start = NSMaxRange(range)
                 }
+            case .wholeName(let pieces):
+                if let range = Pattern.findWholeName(pieces, in: subject) { found.append(range) }
             case .fuzzy(let fuzzy):
                 found += fuzzy.ranges(in: subject, limit: limit - found.count)
             }
@@ -372,10 +510,14 @@ struct QueryMatcher: @unchecked Sendable {
 
     private func firstMatch(in text: String) -> NSRange? {
         clauseLoop: for clause in clauses {
-            if clause.excluded.contains(where: { $0.find(in: text) != nil }) { continue }
+            let isExcluded = clause.excluded.contains { pattern in
+                if case .missing = pattern.find(in: text) { return false }
+                return true
+            }
+            if isExcluded { continue }
             var first: NSRange?
             for pattern in clause.required {
-                guard let range = pattern.find(in: text) else { continue clauseLoop }
+                guard case .found(let range) = pattern.find(in: text) else { continue clauseLoop }
                 first = first ?? range
             }
             return first
@@ -469,14 +611,20 @@ struct QueryMatcher: @unchecked Sendable {
         return groups.filter { !$0.isEmpty }
     }
 
-    static func wildcardPattern(_ text: String, anchored: Bool) -> String {
+    /// `wholeWords`: an edge `*` that is trimmed still lets the word run on, so `rep*` finds
+    /// "report" when the whole match is bounded as a word.
+    static func wildcardPattern(_ text: String, anchored: Bool, wholeWords: Bool = false) -> String {
         // Unanchored, a leading or trailing `*` changes nothing about whether text matches — but
         // `.*x` makes the regex engine rescan every line from each position, which on a single
         // long line (minified JSON) is quadratic: 100,000 characters measured at 48 seconds.
         var text = Substring(text)
+        var (startsOpen, endsOpen) = (false, false)
         if !anchored {
             let trimmed = text.drop { $0 == "*" }.reversed().drop { $0 == "*" }.reversed()
-            if !trimmed.isEmpty { text = Substring(String(trimmed)) }
+            if !trimmed.isEmpty {
+                (startsOpen, endsOpen) = (text.first == "*", text.last == "*")
+                text = Substring(String(trimmed))
+            }
         }
         var pattern = ""
         for character in text {
@@ -486,7 +634,13 @@ struct QueryMatcher: @unchecked Sendable {
             default: pattern += NSRegularExpression.escapedPattern(for: String(character))
             }
         }
-        return anchored ? "^\(pattern)$" : pattern
+        if wholeWords {
+            if startsOpen { pattern = "\\w*" + pattern }
+            if endsOpen { pattern += "\\w*" }
+        }
+        // `\A` and `\z`, not `^` and `$`: those match at every line of a name that contains a
+        // line break, so `*.pdf` found a file whose second line ended in ".pdf".
+        return anchored ? "\\A\(pattern)\\z" : pattern
     }
 }
 

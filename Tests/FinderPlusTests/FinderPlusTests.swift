@@ -179,6 +179,104 @@ final class QueryMatcherTests: XCTestCase {
     }
 }
 
+extension QueryMatcherTests {
+    private func regexMatcher(
+        _ query: String, budget: Duration = .milliseconds(50), _ configure: (inout SearchOptions) -> Void = { _ in }
+    ) throws -> QueryMatcher {
+        var options = SearchOptions()
+        options.mode = .regex
+        configure(&options)
+        return try QueryMatcher(query: query, options: options, anchorsWildcards: false, timeBudget: budget)
+    }
+
+    private var runaway: String { String(repeating: "a", count: 48) + "!" }
+
+    // A text the pattern timed out on was a silent non-match, indistinguishable from a clean miss.
+    func testTimedOutRegexIsNotAMatchAndIsCounted() throws {
+        let m = try regexMatcher("(a+)+$")
+        XCTAssertFalse(m.matches(runaway))
+        XCTAssertEqual(m.timeouts, 1)
+        XCTAssertTrue(try regexMatcher("b+$").matches("abb"))
+    }
+
+    // The budget was per text, so `(a+)+$` over ten thousand names cost hours.
+    func testRunawayRegexIsGivenUpOnAfterAFewShortTexts() throws {
+        let m = try regexMatcher("(a+)+$", budget: .milliseconds(100))
+        let started = ContinuousClock.now
+        for _ in 0..<200 { XCTAssertFalse(m.matches(runaway)) }
+        XCTAssertLessThan(started.duration(to: .now), .seconds(5))
+        XCTAssertEqual(m.timeouts, 200)
+    }
+
+    // A fixed two seconds timed out sound patterns over a 50 MB log on a slower Mac.
+    func testRegexBudgetGrowsWithTheText() {
+        let guardian = QueryMatcher.RegexGuard()
+        XCTAssertLessThan(guardian.budget(forLength: 100), .seconds(3))
+        XCTAssertGreaterThanOrEqual(guardian.budget(forLength: 50_000_000), .seconds(10))
+    }
+
+    // Six stars on a 184-character name ran past two minutes as one anchored regex.
+    func testAnchoredWildcardWithManyStarsIsLinear() throws {
+        let m = try matcher("*a*b*c*d*e*f*.pdf") { $0.mode = .wildcards }
+        let started = ContinuousClock.now
+        XCTAssertFalse(m.matches(String(repeating: "a", count: 180) + ".txt"))
+        XCTAssertFalse(m.matches(String(repeating: "abcdef", count: 30) + ".pdx"))
+        XCTAssertLessThan(started.duration(to: .now), .milliseconds(500))
+        XCTAssertTrue(m.matches("xaxbxcxdxexfx.pdf"))
+        XCTAssertTrue(m.matches("abcdef.pdf"))
+        XCTAssertFalse(m.matches("abcde.pdf"))
+        XCTAssertFalse(try matcher("a*b*c") { $0.mode = .wildcards }.matches("xa-b-c"), "anchored at the start")
+        XCTAssertFalse(try matcher("a*b*c") { $0.mode = .wildcards }.matches("a-b-cx"), "anchored at the end")
+        XCTAssertTrue(try matcher("a*b*c") { $0.mode = .wildcards }.matches("a-b-c"))
+        XCTAssertTrue(try matcher("a*a*aa") { $0.mode = .wildcards }.matches("aaaa"), "a later piece is not starved by an earlier one")
+    }
+
+    // `^` and `$` matched per line, so `*.pdf` found a name whose second line ended in ".pdf".
+    func testAnchoredWildcardMatchesTheWholeNameNotALine() throws {
+        XCTAssertFalse(try matcher("*.pdf") { $0.mode = .wildcards }.matches("notes\nreport.pdf"))
+        XCTAssertFalse(try matcher("a*b*c") { $0.mode = .wildcards }.matches("a\nb\nc"))
+        XCTAssertTrue(try matcher("*.pdf") { $0.mode = .wildcards }.matches("report.pdf"))
+    }
+
+    // The edge `*` was trimmed and the rest bounded as a whole word, so `rep*` found no "report".
+    func testWholeWordsKeepsAnEdgeStar() throws {
+        let text = "The annual report is due on Friday"
+        XCTAssertTrue(try matcher("rep*", anchors: false) { $0.wholeWords = true; $0.mode = .wildcards }.matches(text))
+        XCTAssertTrue(try matcher("*port", anchors: false) { $0.wholeWords = true; $0.mode = .wildcards }.matches(text))
+        XCTAssertTrue(try matcher("*nnual rep*", anchors: false) { $0.wholeWords = true; $0.mode = .wildcards }.matches(text))
+        XCTAssertTrue(try matcher("rep* AND fri*", anchors: false) { $0.wholeWords = true; $0.mode = .boolean }.matches(text))
+        XCTAssertTrue(try matcher("*nnu*epo*", anchors: false) { $0.wholeWords = true; $0.mode = .wildcards }.matches(text))
+        // The open left edge is lazy: greedy, it ran to the last "foo" and then found no "bar".
+        XCTAssertTrue(try matcher("*foo*bar*", anchors: false) { $0.wholeWords = true; $0.mode = .wildcards }.matches("a foobarfoo b"))
+        XCTAssertFalse(try matcher("rep*", anchors: false) { $0.wholeWords = true; $0.mode = .wildcards }.matches("a prep step"))
+        XCTAssertFalse(try matcher("*port", anchors: false) { $0.wholeWords = true; $0.mode = .wildcards }.matches("reports"))
+    }
+
+    // A phrase was one escaped literal, so a line break in the file split it.
+    func testPhraseMatchesAcrossLineBreaks() throws {
+        let text = "The annual\n  report is due"
+        let phrase = try matcher("annual report", anchors: false) { $0.mode = .phrase }
+        XCTAssertTrue(phrase.matches(text))
+        let snippet = try XCTUnwrap(phrase.snippet(in: text))
+        XCTAssertEqual((snippet.text as NSString).substring(with: snippet.match), "annual report")
+        XCTAssertEqual(phrase.ranges(in: text), [NSRange(location: 4, length: 15)])
+        XCTAssertTrue(try matcher("\"annual report\" due", anchors: false).matches(text))
+        XCTAssertFalse(phrase.matches("The annualreport"))
+    }
+
+    // Folding rewrote the pattern itself: `[À-ÿ]` became `[A-y]`, which matches "p".
+    func testRegexModeDoesNotFoldTheDiacritics() throws {
+        XCTAssertFalse(try regexMatcher("[À-ÿ]").matches("pqrs"))
+        XCTAssertTrue(try regexMatcher("[À-ÿ]").matches("café"))
+        XCTAssertTrue(try regexMatcher("café").matches("un café noir"))
+        XCTAssertTrue(try regexMatcher("\\p{Mn}").matches("x\u{301}"))
+        XCTAssertTrue(try regexMatcher("CAFÉ").matches("café"), "Ignore Case still applies")
+        XCTAssertEqual(try regexMatcher("caf.").ranges(in: "café au lait"), [NSRange(location: 0, length: 4)])
+        // The other modes still fold.
+        XCTAssertTrue(try matcher("cafe", anchors: false).matches("café"))
+    }
+}
+
 final class SearchLocationTests: XCTestCase {
     func testIDsRoundTripAndOldAllVolumesIDStillResolves() {
         for location in SearchLocation.scopes + [.activeFinderWindow, .folder("/Users/someone/Work")] {
@@ -539,7 +637,7 @@ final class AuditFixTests: XCTestCase {
         XCTAssertTrue(matcher.matches(line + " report.pdf"))
         XCTAssertLessThan(started.duration(to: .now), .seconds(1))
         XCTAssertEqual(QueryMatcher.wildcardPattern("*.pdf*", anchored: false), "\\.pdf")
-        XCTAssertEqual(QueryMatcher.wildcardPattern("*.pdf", anchored: true), "^.*\\.pdf$")
+        XCTAssertEqual(QueryMatcher.wildcardPattern("*.pdf", anchored: true), "\\A.*\\.pdf\\z")
 
         // A `*` in the middle used to become `.*`, which ICU rescans from every match of the
         // first piece — quadratic on one long line. Trimming the ends never covered it.
@@ -729,6 +827,47 @@ final class AuditFixTests: XCTestCase {
         XCTAssertEqual(hits.map(\.kind), ["MTS File", "TS File"])
     }
 
+    // `.mts` is exempt from the Video exclusion for TypeScript, which let a camcorder's AVCHD
+    // clip through too.
+    func testVideoExclusionStillHidesRealTransportStreams() throws {
+        _ = try write("config.mts", "export const x = 1")
+        _ = try write("Cargo.mts", "G is for guitar")
+        var packets = Data()
+        for _ in 0..<4 { packets += Data([0x00, 0x00, 0x00, 0x00, 0x47]) + Data(repeating: 0x11, count: 187) }
+        try packets.write(to: root.appending(path: "clip.MTS"))
+        var plain = Data()
+        for _ in 0..<4 { plain += Data([0x47]) + Data(repeating: 0x22, count: 187) }
+        try plain.write(to: root.appending(path: "tv.ts"))
+        XCTAssertEqual(try walk("c") { $0.excludedKinds = [.video] }.map(\.name), ["Cargo.mts", "config.mts"])
+    }
+
+    // The sniff opens the file: a FIFO named x.ts blocked the walk for good, and it ran before
+    // the name was even tested.
+    func testTransportStreamSniffSkipsFIFOsAndNonMatches() throws {
+        XCTAssertEqual(mkfifo(root.appending(path: "fifo.ts").path, 0o644), 0)
+        _ = try write("other.ts", "export {}")
+        XCTAssertEqual(try walk("other") { $0.excludedKinds = [.video] }.map(\.name), ["other.ts"])
+        XCTAssertEqual(try walk("fifo") { $0.excludedKinds = [.video] }.map(\.name), ["fifo.ts"])
+    }
+
+    // A timeout used to be a silent miss: the status bar must say the search could not check them.
+    func testRegexTimeoutsAreReportedWithTheProgress() throws {
+        let name = String(repeating: "a", count: 48) + "!.txt"
+        _ = try write(name, "x")
+        var options = SearchOptions()
+        options.mode = .regex
+        let request = try SearchRequest(
+            roots: [root], query: "^(a+)+$", options: options, matchBudget: .milliseconds(50))
+        var timedOut = 0
+        var hits = 0
+        SearchEngine.walk(request) { event in
+            if case .hits(let batch) = event { hits += batch.count }
+            if case .progress(_, _, _, let count) = event { timedOut = max(timedOut, count) }
+        }
+        XCTAssertEqual(hits, 0)
+        XCTAssertGreaterThanOrEqual(timedOut, 1)
+    }
+
     // A file the search could not open looked exactly like a file that does not contain the words:
     // found nothing, counted nothing.
     func testUnreadableFilesAreCountedNotSilentlySkipped() throws {
@@ -744,7 +883,7 @@ final class AuditFixTests: XCTestCase {
         var unreadable = 0
         SearchEngine.walk(request) { event in
             if case .hits(let batch) = event { names += batch.map(\.name) }
-            if case .progress(_, _, let count) = event { unreadable = max(unreadable, count) }
+            if case .progress(_, _, let count, _) = event { unreadable = max(unreadable, count) }
         }
         XCTAssertEqual(names, ["open.txt"])
         XCTAssertGreaterThanOrEqual(unreadable, 1)
@@ -850,6 +989,18 @@ final class AuditModelTests: XCTestCase {
         guard case .failed = model.phase else { return XCTFail("\(model.phase)") }
     }
 
+    // A saved sort on the Match column left a name-only search in walk order: every snippet is empty
+    // and the column is hidden, so nothing showed it or let it be changed.
+    func testMatchSortFallsBackToNameWhenNothingHasASnippet() {
+        let model = SearchModel(defaults: defaults)
+        model.sortOrder = [KeyPathComparator(\FileHit.snippetText)]
+        model.results = ["b.txt", "c.txt", "a.txt"].map {
+            FileHit(url: URL(filePath: "/tmp/\($0)"), name: $0, isFolder: false, size: 1, modified: .now, kind: "Text")
+        }
+        model.resort()
+        XCTAssertEqual(model.results.map(\.name), ["a.txt", "b.txt", "c.txt"])
+    }
+
     func testSortOrderIsRemembered() {
         let first = SearchModel(defaults: defaults)
         first.sortOrder = [KeyPathComparator(\FileHit.size, order: .reverse)]
@@ -872,7 +1023,7 @@ final class DocumentTextTests: XCTestCase {
     }
 
     /// Builds a zip whose members are the given files, the way Office and EPUB files are made.
-    private func makeZip(_ name: String, _ members: [String: String]) throws -> URL {
+    private func makeZip(_ name: String, _ members: [String: String], order: [String]? = nil) throws -> URL {
         let staging = root.appending(path: "staging-\(name)")
         for (path, text) in members {
             let url = staging.appending(path: path)
@@ -882,7 +1033,8 @@ final class DocumentTextTests: XCTestCase {
         let zip = Process()
         zip.executableURL = URL(filePath: "/usr/bin/zip")
         zip.currentDirectoryURL = staging
-        zip.arguments = ["-qr", root.appending(path: name).path, "."]
+        // `order` fixes the archive order, which `bsdtar -xO` writes in.
+        zip.arguments = ["-qr", root.appending(path: name).path] + (order ?? ["."])
         try zip.run()
         zip.waitUntilExit()
         return root.appending(path: name)
@@ -982,6 +1134,242 @@ final class DocumentTextTests: XCTestCase {
         let rtf = root.appending(path: "note.rtf")
         try #"{\rtf1\ansi Hello from RTF}"#.write(to: rtf, atomically: true, encoding: .utf8)
         XCTAssertTrue(try XCTUnwrap(SearchEngine.contentText(of: rtf, size: 100)).contains("Hello from RTF"))
+    }
+
+    // Swift Regex passes over a big worksheet cost 1.2 GB and seconds between Stop checks.
+    func testStoppingInterruptsALargeMarkupPassAtOnce() {
+        let markup = String(repeating: "<c r=\"A1\"><v>1</v></c>", count: 2_000_000)
+        let started = ContinuousClock.now
+        XCTAssertEqual(DocumentText.markupText(markup, isStopped: { true }), "")
+        XCTAssertLessThan(started.duration(to: .now), .milliseconds(500))
+    }
+
+    // Only so many zip and Office extractions run at once: one per core held every file's XML.
+    func testHeavyExtractionsAreCapped() {
+        let running = OSAllocatedUnfairLock(initialState: (now: 0, peak: 0))
+        DispatchQueue.concurrentPerform(iterations: 12) { _ in
+            _ = DocumentText.withHeavySlot(isStopped: { false }) { () -> Int? in
+                running.withLock { $0.now += 1; $0.peak = max($0.peak, $0.now) }
+                Thread.sleep(forTimeInterval: 0.05)
+                running.withLock { $0.now -= 1 }
+                return 1
+            }
+        }
+        let peak = running.withLock { $0.peak }
+        XCTAssertLessThanOrEqual(peak, 3)
+        XCTAssertGreaterThanOrEqual(peak, 1)
+    }
+
+    // A self-closing <script/> took everything up to the next </script> with it, an EPUB chapter
+    // among it; a mixed-case <SCRIPT> was never removed.
+    func testSelfClosingAndMixedCaseScriptTags() {
+        let text = DocumentText.markupText(
+            "<p>Call me</p><script src=\"a.js\"/><p>Ishmael</p><SCRIPT>var hidden</script><style>.x{}</STYLE><p>end</p>")
+        XCTAssertTrue(text.contains("Ishmael"), text)
+        XCTAssertTrue(text.contains("end"), text)
+        XCTAssertFalse(text.contains("hidden"), text)
+        XCTAssertFalse(text.contains(".x"), text)
+    }
+
+    // Excel's <rPr> always carries <sz>, <color> and <rFont>, PowerPoint's <a:rPr> its fills and
+    // fonts: each child became a space inside the word.
+    func testRunPropertiesDoNotSplitWords() {
+        XCTAssertEqual(
+            DocumentText.markupText(
+                "<si><r><rPr><sz val=\"11\"/><color rgb=\"FF\"/><rFont val=\"Calibri\"/></rPr><t>Quar</t></r>"
+                    + "<r><rPr><b/><family val=\"2\"/></rPr><t>terly</t></r></si>"),
+            " Quarterly ")
+        XCTAssertEqual(
+            DocumentText.markupText(
+                "<a:p><a:r><a:rPr lang=\"en\"><a:solidFill><a:srgbClr val=\"000\"/></a:solidFill><a:latin typeface=\"Arial\"/></a:rPr>"
+                    + "<a:t>Quar</a:t></a:r><a:r><a:rPr/><a:t>terly</a:t></a:r></a:p>"),
+            " Quarterly ")
+    }
+
+    // Only a:r and a:t were known as runs, so another prefix split the word.
+    func testPrefixedRunsDoNotSplitWords() {
+        XCTAssertEqual(DocumentText.markupText("<x:r><x:t>Quar</x:t></x:r><x:r><x:t>terly</x:t></x:r>"), "Quarterly")
+        XCTAssertEqual(DocumentText.markupText("<w:r><w:t>Quar</w:t></w:r><w:r><w:t>terly</w:t></w:r>"), "Quarterly")
+        XCTAssertEqual(DocumentText.markupText("a<text:s/>b"), "a b", "ODF's text:s is a space")
+    }
+
+    // A password-protected docx is an OLE container: the readers refuse it and the sniff calls it binary.
+    func testEncryptedWordFileIsCountedUnreadable() throws {
+        let locked = root.appending(path: "locked.docx")
+        try Data([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1] + [UInt8](repeating: 0, count: 600)).write(to: locked)
+        var count = 0
+        XCTAssertNil(SearchEngine.contentText(of: locked, size: 608, onUnreadable: { count += 1 }))
+        XCTAssertEqual(count, 1)
+    }
+
+    // The preview queued behind the search for one of the three slots.
+    func testPreviewExtractionIsNotHeldUpByBusySlots() throws {
+        let xlsx = try makeZip("busy.xlsx", ["xl/sharedStrings.xml": "<sst><si><t>apple</t></si></sst>"])
+        let release = DispatchSemaphore(value: 0)
+        let held = DispatchSemaphore(value: 0)
+        for _ in 0..<3 {
+            DispatchQueue.global().async {
+                _ = DocumentText.withHeavySlot(isStopped: { false }) { () -> Int? in
+                    held.signal()
+                    release.wait()
+                    return 1
+                }
+            }
+        }
+        for _ in 0..<3 { held.wait() }
+        defer { for _ in 0..<3 { release.signal() } }
+        let text = SearchEngine.contentText(of: xlsx, size: 1, isStopped: { false }, capsExtractions: false)
+        XCTAssertEqual(text?.contains("apple"), true)
+    }
+
+    // Ruby annotations fused into the base text: "漢<rt>かん</rt>字" read "漢かん字".
+    func testRubyAnnotationsAreLeftOut() {
+        XCTAssertEqual(DocumentText.markupText("<ruby>漢<rp>(</rp><rt>かん</rt><rp>)</rp>字</ruby>"), "漢字")
+    }
+
+    // Prefixed cells kept their indices, and after a self-closing <c t="s"/> the lazy body ate the
+    // next cell's value.
+    func testSharedStringCellsWithPrefixesAndSelfClosingForm() throws {
+        let xlsx = try makeZip("cells.xlsx", [
+            "xl/sharedStrings.xml": "<sst><si><t>apple</t></si></sst>",
+            "xl/worksheets/sheet1.xml": "<sheetData><row><x:c r=\"A1\" t=\"s\"><x:v>31337</x:v></x:c>"
+                + "<c r=\"B1\" t=\"s\"/><c r=\"C1\"><v>98765</v></c></row></sheetData>",
+        ])
+        let text = try XCTUnwrap(SearchEngine.contentText(of: xlsx, size: 1))
+        XCTAssertTrue(text.contains("98765"), text)
+        XCTAssertFalse(text.contains("31337"), text)
+    }
+
+    // `bsdtar -xO` writes members in archive order and Excel stores sharedStrings.xml after the
+    // worksheets, so a workbook whose sheets filled the budget never had its words read.
+    func testSharedStringsAreReadBeforeTheSheets() throws {
+        let sheet = "<sheetData>" + String(repeating: "<row><c><v>1</v></c></row>", count: 8000) + "</sheetData>"
+        let xlsx = try makeZip("late.xlsx", [
+            "xl/worksheets/sheet1.xml": sheet,
+            "xl/sharedStrings.xml": "<sst><si><t>Lighthouse</t></si></sst>",
+        ], order: ["xl/worksheets/sheet1.xml", "xl/sharedStrings.xml"])
+        let text = try XCTUnwrap(SearchEngine.contentText(of: xlsx, size: 1, maxBytes: 100_000))
+        XCTAssertTrue(text.contains("Lighthouse"), text)
+    }
+
+    func testMoreOfficeExtensionsHaveReaders() {
+        for ext in ["xlsx", "xlsm", "xltx", "xltm"] {
+            XCTAssertEqual(DocumentText.zipMembers(forExtension: ext)?.first, "xl/sharedStrings.xml", ext)
+        }
+        for ext in ["pptx", "pptm", "ppsx", "ppsm", "potx", "potm"] {
+            XCTAssertEqual(DocumentText.zipMembers(forExtension: ext)?.first, "ppt/slides/*.xml", ext)
+        }
+    }
+
+    // A file the search could not make sense of looked like one that lacked the words.
+    func testEncryptedOfficeAndBrokenPDFAreCountedUnreadable() throws {
+        // Encrypted workbooks are OLE containers behind a zip name.
+        let encrypted = root.appending(path: "locked.xlsx")
+        try Data([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1] + [UInt8](repeating: 7, count: 600)).write(to: encrypted)
+        var count = 0
+        XCTAssertNil(SearchEngine.contentText(of: encrypted, size: 600, onUnreadable: { count += 1 }))
+        XCTAssertEqual(count, 1)
+
+        let broken = root.appending(path: "broken.pdf")
+        try Data("not a pdf at all".utf8).write(to: broken)
+        count = 0
+        XCTAssertNil(SearchEngine.contentText(of: broken, size: 16, onUnreadable: { count += 1 }))
+        XCTAssertEqual(count, 1)
+
+        // A pattern with no member behind it fails too, but the workbook was read: not counted.
+        let fine = try makeZip("fine.xlsx", ["xl/sharedStrings.xml": "<sst><si><t>x</t></si></sst>"])
+        count = 0
+        XCTAssertNotNil(SearchEngine.contentText(of: fine, size: 1, onUnreadable: { count += 1 }))
+        XCTAssertEqual(count, 0)
+    }
+
+    // `looksLikeHTML` ran on every sniffed file, so a PHP view that opened with `<!doctype html`
+    // came back as its text with every tag and `<?php … ?>` block stripped.
+    func testTemplatesOpeningWithADoctypeAreNotStrippedAsHTML() throws {
+        let source = "<!doctype html>\n<html><body><?php if ($claim->getId() > 0): ?>Claim <?= $claim->getId() ?><?php endif ?></body></html>"
+        for name in ["view.php", "view.erb", "page.twig", "notes.md", "plain.txt", "app.js"] {
+            let url = root.appending(path: name)
+            try source.write(to: url, atomically: true, encoding: .utf8)
+            XCTAssertEqual(SearchEngine.contentText(of: url, size: Int64(source.utf8.count)), source, name)
+        }
+        // A page typed as HTML still reads as what it says.
+        let page = root.appending(path: "page.html")
+        try source.write(to: page, atomically: true, encoding: .utf8)
+        XCTAssertFalse(try XCTUnwrap(SearchEngine.contentText(of: page, size: Int64(source.utf8.count))).contains("<body>"))
+    }
+
+    private func textutil(_ format: String, from text: String, as name: String) throws -> URL {
+        let source = root.appending(path: "source-\(name).txt")
+        try text.write(to: source, atomically: true, encoding: .utf8)
+        let output = root.appending(path: name)
+        let process = Process()
+        process.executableURL = URL(filePath: "/usr/bin/textutil")
+        process.arguments = ["-convert", format, "-output", output.path, source.path]
+        try process.run()
+        process.waitUntilExit()
+        return output
+    }
+
+    // The forced reader failed on a file named for another format: RTF saved as .doc came back
+    // as raw RTF, and a docx named .doc, a doc named .docx and an odt named .doc as nothing.
+    func testWordFilesWithTheWrongExtensionAreReadByTheirContents() throws {
+        let words = "Lighthouse keeper"
+        for (format, name) in [("rtf", "rtf-as.doc"), ("docx", "docx-as.doc"), ("doc", "doc-as.docx"), ("odt", "odt-as.doc")] {
+            let real = try textutil(format, from: words, as: "real.\(format)")
+            let misnamed = root.appending(path: name)
+            try FileManager.default.copyItem(at: real, to: misnamed)
+            let size = try XCTUnwrap(try FileManager.default.attributesOfItem(atPath: misnamed.path)[.size] as? Int64)
+            let text = try XCTUnwrap(SearchEngine.contentText(of: misnamed, size: size), name)
+            XCTAssertTrue(text.contains(words), "\(name): \(text)")
+            XCTAssertFalse(text.contains("rtf1"), "\(name): \(text)")
+        }
+        let wordML = root.appending(path: "wordml.doc")
+        let xml = "<?xml version=\"1.0\"?><w:wordDocument xmlns:w=\"http://schemas.microsoft.com/office/word/2003/wordml\">"
+            + "<w:body><w:p><w:r><w:t>Lighthouse keeper</w:t></w:r></w:p></w:body></w:wordDocument>"
+        try xml.write(to: wordML, atomically: true, encoding: .utf8)
+        let text = try XCTUnwrap(SearchEngine.contentText(of: wordML, size: Int64(xml.utf8.count)))
+        XCTAssertTrue(text.contains(words), text)
+        XCTAssertFalse(text.contains("<w:"), text)
+    }
+
+    private func retypePackage(_ package: URL, from old: String, to new: String) throws {
+        let staging = root.appending(path: "retype-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        for (tool, arguments) in [("/usr/bin/bsdtar", ["-xf", package.path, "-C", staging.path])] {
+            let process = Process()
+            process.executableURL = URL(filePath: tool)
+            process.arguments = arguments
+            try process.run()
+            process.waitUntilExit()
+        }
+        let types = staging.appending(path: "[Content_Types].xml")
+        try String(contentsOf: types, encoding: .utf8).replacingOccurrences(of: old, with: new)
+            .write(to: types, atomically: true, encoding: .utf8)
+        try FileManager.default.removeItem(at: package)
+        let zip = Process()
+        zip.executableURL = URL(filePath: "/usr/bin/zip")
+        zip.currentDirectoryURL = staging
+        zip.arguments = ["-qr", package.path, "."]
+        try zip.run()
+        zip.waitUntilExit()
+    }
+
+    // .docm, .dotx, .dotm, .dot and .ott conform to none of the reader types and were never read.
+    func testMacroAndTemplateWordFormatsAreRead() throws {
+        for (format, name) in [("docx", "macro.docm"), ("docx", "template.dotx"), ("docx", "template.dotm"),
+                               ("doc", "template.dot"), ("odt", "template.ott")] {
+            let real = try textutil(format, from: "Lighthouse keeper", as: "real-\(name).\(format)")
+            let copy = root.appending(path: name)
+            try FileManager.default.copyItem(at: real, to: copy)
+            // Office writes the variant's own content type into the package, not the docx one.
+            if format == "docx" {
+                try retypePackage(copy, from: "wordprocessingml.document.main+xml",
+                                  to: name.hasSuffix("docm") ? "wordprocessingml.document.macroEnabled.main+xml"
+                                      : "wordprocessingml.template.main+xml")
+            }
+            let text = try XCTUnwrap(SearchEngine.contentText(of: copy, size: 1), name)
+            XCTAssertTrue(text.contains("Lighthouse keeper"), "\(name): \(text)")
+        }
     }
 
     func testTextIsRecognisedInAnImage() throws {
@@ -1241,6 +1629,255 @@ final class ResultActionTests: XCTestCase {
         XCTAssertEqual(ghosts.count, 0, "rows under the old path: \(ghosts.prefix(3).map(\.url.path))")
         XCTAssertTrue(model.results.allSatisfy { FileManager.default.fileExists(atPath: $0.url.path) },
                       "every row must answer to a file on disk")
+    }
+
+    // MARK: Mid-walk changes and Find again
+
+    private var walked: String { SearchEngine.walkedPath(of: root) }
+
+    /// A row as the walk reports it, under the walk's /private/var spelling.
+    private func row(_ path: String, folder: Bool = false) -> FileHit {
+        let url = URL(filePath: walked + "/" + path, directoryHint: folder ? .isDirectory : .notDirectory)
+        return FileHit(url: url, name: url.lastPathComponent, isFolder: folder, size: folder ? -1 : 1,
+                       modified: .now, kind: folder ? "Folder" : "Text")
+    }
+
+    private func walkedURL(_ path: String, folder: Bool = false) -> URL {
+        URL(filePath: walked + "/" + path, directoryHint: folder ? .isDirectory : .notDirectory)
+    }
+
+    private func paths(_ model: SearchModel) -> [String] {
+        model.results.map { String($0.url.path.dropFirst(walked.count + 1)) }.sorted()
+    }
+
+    private func searchingModel(_ rows: [FileHit]) -> SearchModel {
+        let model = SearchModel(defaults: defaults)
+        model.phase = .searching
+        model.results = rows
+        model.knownIDs = Set(rows.map(\.id))
+        return model
+    }
+
+    // Folder A renamed to B and B trashed mid-walk: a straggler A/y was checked against the
+    // trashed paths before it was moved to B, so it survived as a row for a trashed file.
+    func testStragglerOfARenamedThenTrashedFolderIsDropped() throws {
+        _ = try write("A/x.txt", "x")
+        _ = try write("A/y.txt", "x")
+        let model = searchingModel([row("A", folder: true), row("A/x.txt")])
+        let outcome = SearchModel.performRename(
+            [RenameStep(source: walkedURL("A", folder: true), target: walkedURL("B", folder: true))])
+        XCTAssertEqual(outcome.failed, [])
+        model.relocateRows(after: outcome)
+        // What trash() does for B, bar the real Trash.
+        let trashed = walkedURL("B", folder: true)
+        try FileManager.default.removeItem(at: trashed)
+        model.results.removeAll { $0.url.path.hasPrefix(trashed.path) }
+        model.walkTrashed.insert(trashed.path)
+        model.knownIDs = Set(model.results.map(\.id))
+
+        model.apply(.hits([row("A/y.txt")]))
+        XCTAssertEqual(paths(model), [])
+    }
+
+    // Draft 1 and Draft 2 renumbered to Draft 2 and Draft 3: the walk lists the parent afterwards
+    // and reports "Draft 2/a draft.txt", which is the real file. Sent on to Draft 3 it became a
+    // ghost that survived the walk.
+    func testHitsAtReusedPathsAreNotRemappedAfterARenumbering() throws {
+        _ = try write("Draft 1/a draft.txt", "x")
+        _ = try write("Draft 2/b draft.txt", "x")
+        let model = searchingModel([
+            row("Draft 1", folder: true), row("Draft 1/a draft.txt"),
+            row("Draft 2", folder: true), row("Draft 2/b draft.txt"),
+        ])
+        let outcome = SearchModel.performRename([
+            RenameStep(source: walkedURL("Draft 2", folder: true), target: walkedURL("Draft 3", folder: true)),
+            RenameStep(source: walkedURL("Draft 1", folder: true), target: walkedURL("Draft 2", folder: true)),
+        ])
+        XCTAssertEqual(outcome.failed, [])
+        model.relocateRows(after: outcome)
+        model.apply(.hits([
+            row("Draft 2", folder: true), row("Draft 2/a draft.txt"),
+            row("Draft 3", folder: true), row("Draft 3/b draft.txt"),
+        ]))
+        XCTAssertEqual(paths(model), ["Draft 2", "Draft 2/a draft.txt", "Draft 3", "Draft 3/b draft.txt"])
+        XCTAssertTrue(model.results.allSatisfy { FileManager.default.fileExists(atPath: $0.url.path) })
+    }
+
+    // Report.pdf trashed and a new one created in its place: the walk reports the new file at the
+    // trashed path, and it was dropped with the old one.
+    func testHitAtATrashedPathIsKeptWhenAFileIsThereAgain() throws {
+        let old = try write("Report.pdf", "old")
+        let model = searchingModel([row("Report.pdf")])
+        try FileManager.default.removeItem(at: old)
+        model.results = []
+        model.knownIDs = []
+        model.walkTrashed.insert(walkedURL("Report.pdf").path)
+        _ = try write("Report.pdf", "new")
+        model.apply(.hits([row("Report.pdf")]))
+        XCTAssertEqual(paths(model), ["Report.pdf"])
+    }
+
+    // A to B, then B/sub to B/sub2: a straggler found under A/sub arrived as B/sub/g.txt, where
+    // nothing is.
+    func testStragglerFollowsARenameInsideAnEarlierRenamesNewPath() throws {
+        _ = try write("A/sub/f.txt", "x")
+        _ = try write("A/sub/g.txt", "x")
+        let model = searchingModel([row("A", folder: true), row("A/sub", folder: true), row("A/sub/f.txt")])
+        let first = SearchModel.performRename(
+            [RenameStep(source: walkedURL("A", folder: true), target: walkedURL("B", folder: true))])
+        model.relocateRows(after: first)
+        let second = SearchModel.performRename(
+            [RenameStep(source: walkedURL("B/sub", folder: true), target: walkedURL("B/sub2", folder: true))])
+        XCTAssertEqual(second.failed, [])
+        model.relocateRows(after: second)
+        model.apply(.hits([row("A/sub/g.txt")]))
+        XCTAssertEqual(paths(model), ["B", "B/sub2", "B/sub2/f.txt", "B/sub2/g.txt"])
+    }
+
+    // Find again keeps the rows on screen through an off-main check, and the user can rename or
+    // trash during it; adopting the snapshot then put the old names and trashed rows back.
+    func testFindAgainAdoptsRowsWithChangesMadeWhileItChecked() throws {
+        _ = try write("A/x.txt", "x")
+        _ = try write("C/z.txt", "x")
+        let kept = [row("A", folder: true), row("A/x.txt"), row("C", folder: true), row("C/z.txt")]
+        let model = searchingModel([])
+        let outcome = SearchModel.performRename(
+            [RenameStep(source: walkedURL("A", folder: true), target: walkedURL("B", folder: true))])
+        model.relocateRows(after: outcome)
+        let trashed = walkedURL("C", folder: true)
+        try FileManager.default.removeItem(at: trashed)
+        model.walkTrashed.insert(trashed.path)
+
+        let run = SearchModel.Run(roots: [walked], options: model.options, limits: model.settings.limits)
+        model.adopt(kept, for: run, at: .folder(root.path))
+        XCTAssertEqual(paths(model), ["B", "B/x.txt"])
+        XCTAssertTrue(model.results.allSatisfy { FileManager.default.fileExists(atPath: $0.url.path) })
+    }
+
+    // Stopped before the rows are adopted, the old rows are still on screen and the subtitle read
+    // "N matches in <the new place>".
+    func testLocationLabelChangesWithTheRowsNotWithTheClick() async throws {
+        _ = try write("note.txt", "x")
+        let model = SearchModel(defaults: defaults)
+        model.locationID = root.path
+        model.query = "note"
+        model.start()
+        XCTAssertNil(model.searchedLocation)
+        try await finish(model)
+        XCTAssertEqual(model.searchedLocation, .folder(root.path))
+    }
+
+    // MARK: Trash, Copy To and Move To
+
+    // The confirmation alert displayed for real under `swift test` and held the suite until
+    // someone clicked it. Gated, the call returns and nothing is trashed.
+    func testTrashDoesNotShowItsAlertUnderTests() async throws {
+        let file = try write("keep.txt", "x")
+        let model = SearchModel(defaults: defaults)
+        XCTAssertTrue(model.settings.confirmTrash)
+        model.results = [row("keep.txt")]
+        await model.trash([model.results[0].id])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+    }
+
+    // Folder and child both selected: only the folder is tried, so a refused folder left the child
+    // untried. The child is asked for again when its folder was refused, and only then.
+    func testItemsCoveredByARefusedFolderAreTriedAgain() {
+        let folder = URL(filePath: "/x/album", directoryHint: .isDirectory)
+        let track = URL(filePath: "/x/album/disc/track.mp3")
+        let disc = URL(filePath: "/x/album/disc", directoryHint: .isDirectory)
+        let other = URL(filePath: "/x/loose.txt")
+        let selected = [folder, track, disc, other]
+        XCTAssertEqual(SearchModel.coveredByRefused(selected, refused: [folder]), [disc])
+        XCTAssertEqual(SearchModel.coveredByRefused(selected, refused: [other]), [])
+        XCTAssertEqual(SearchModel.coveredByRefused(selected, refused: []), [])
+    }
+
+    // `fileExists` follows links, so a dangling symlink in the destination read as a free name:
+    // the copy failed with "already exists" and the cleanup after it deleted the user's link.
+    func testADanglingSymlinkAtTheTargetCountsAsTaken() throws {
+        let source = try write("src/a.txt", "x")
+        let destination = root.appending(path: "dest")
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let link = destination.appending(path: "a.txt")
+        try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: "/Volumes/Gone/a.txt")
+
+        let copied = SearchModel.perform(.copy, [source], into: destination)
+        XCTAssertEqual(copied.failed, [])
+        XCTAssertEqual(copied.done[source]?.lastPathComponent, "a 2.txt")
+        XCTAssertNotNil(try? FileManager.default.destinationOfSymbolicLink(atPath: link.path), "the link was deleted")
+
+        let moved = SearchModel.perform(.move, [source], into: destination)
+        XCTAssertEqual(moved.failed, [])
+        XCTAssertEqual(moved.done[source]?.lastPathComponent, "a 3.txt")
+        XCTAssertNotNil(try? FileManager.default.destinationOfSymbolicLink(atPath: link.path))
+    }
+
+    func testAlreadyExistsErrorsAreRecognised() {
+        XCTAssertTrue(SearchModel.isAlreadyExists(CocoaError(.fileWriteFileExists)))
+        XCTAssertTrue(SearchModel.isAlreadyExists(NSError(domain: NSPOSIXErrorDomain, code: Int(EEXIST))))
+        XCTAssertTrue(SearchModel.isAlreadyExists(
+            NSError(domain: NSCocoaErrorDomain, code: NSFileWriteUnknownError, userInfo: [
+                NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(EEXIST)),
+            ])))
+        XCTAssertFalse(SearchModel.isAlreadyExists(CocoaError(.fileWriteNoPermission)))
+    }
+
+    private func run(_ tool: String, _ arguments: [String]) throws -> Bool {
+        let process = Process()
+        process.executableURL = URL(filePath: tool)
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        return process.terminationStatus == 0
+    }
+
+    // A move across volumes copies and then deletes. With a read-only subfolder the delete fails
+    // halfway: the copy is whole and the original is part gone, but the move was reported as not
+    // done and blamed on the destination, and the row stayed at the original.
+    func testACrossVolumeMoveThatCannotRemoveTheOriginalIsReportedAsCopied() throws {
+        let image = root.appending(path: "volume.sparseimage")
+        let mount = root.appending(path: "mnt")
+        try FileManager.default.createDirectory(at: mount, withIntermediateDirectories: true)
+        guard try run("/usr/bin/hdiutil", ["create", "-size", "40m", "-fs", "APFS", "-type", "SPARSE",
+                                           "-volname", "FPTest", root.appending(path: "volume").path]),
+              try run("/usr/bin/hdiutil", ["attach", "-mountpoint", mount.path, "-nobrowse", image.path])
+        else { throw XCTSkip("Could not create a second volume to move across") }
+        addTeardownBlock { _ = try? self.run("/usr/bin/hdiutil", ["detach", "-force", mount.path]) }
+
+        _ = try write("Album/one.txt", "x")
+        let sealed = try write("Album/sealed/two.txt", "x").deletingLastPathComponent()
+        let album = root.appending(path: "Album")
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: sealed.path)
+        addTeardownBlock { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: sealed.path) }
+
+        let outcome = SearchModel.perform(.move, [album], into: mount)
+        XCTAssertEqual(outcome.done[album]?.path, mount.appending(path: "Album").path)
+        XCTAssertEqual(outcome.failed.count, 1, "\(outcome.failed)")
+        XCTAssertTrue(outcome.failed[0].contains("Copied to"), outcome.failed[0])
+        XCTAssertFalse(outcome.deniedByPermissions)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: mount.appending(path: "Album/sealed/two.txt").path))
+        // Nothing is made on a retry beside the copy: it is the caller's row that follows it.
+        XCTAssertFalse(FileManager.default.fileExists(atPath: mount.appending(path: "Album 2").path))
+    }
+
+    // MARK: Rename
+
+    // The holding name a file is parked under shows to a walk that lists the folder meanwhile.
+    // Rows it produced follow the file to where it ended up, and so do hits that arrive later.
+    func testRowsUnderAHoldingNameFollowTheFile() async throws {
+        _ = try write("one.txt", "x")
+        let holding = walkedURL(".FinderPlus-rename-tok-0")
+        let target = walkedURL("two.txt")
+        let model = searchingModel([row("one.txt"), FileHit(
+            url: holding, name: holding.lastPathComponent, isFolder: false, size: 1, modified: .now, kind: "Text")])
+        await model.rename([RenameStep(source: walkedURL("one.txt"), target: target)], token: "tok")
+        XCTAssertEqual(paths(model), ["two.txt"])
+        model.apply(.hits([FileHit(
+            url: holding, name: holding.lastPathComponent, isFolder: false, size: 1, modified: .now, kind: "Text")]))
+        XCTAssertEqual(paths(model), ["two.txt"])
     }
 
     func testDuplicatesAreGroupedAndTheFullListComesBack() async throws {
@@ -1621,6 +2258,17 @@ final class BatchRenameTests: XCTestCase {
         recipe.action = .changeCase
         recipe.caseStyle = .uppercase
         XCTAssertEqual(BatchRename.plan([locked], recipe: recipe).map(\.problem), ["File is locked"])
+    }
+
+    // A leading dot is refused because it would hide the file, which a dotfile already is.
+    func testPlanAllowsRenamingAnAlreadyHiddenFile() throws {
+        let folder = try makeFolder()
+        let env = try hit(folder, ".env.local")
+        let plan = BatchRename.plan([env], recipe: replacing("local", with: "prod"))
+        XCTAssertEqual(plan.map(\.name), [".env.prod"])
+        XCTAssertEqual(plan.map(\.problem), [nil])
+        let visible = try hit(folder, "IMG.jpg")
+        XCTAssertNotNil(BatchRename.plan([visible], recipe: replacing("IMG", with: "")).first?.problem)
     }
 
     func testPlanLeavesAnUnchangedNameAloneAndAllowsASwap() throws {

@@ -219,10 +219,11 @@ final class SearchModel {
     var resultsFocusRequest = 0
     var showsSidebar = true
 
-    private(set) var phase: Phase = .idle
+    var phase: Phase = .idle
     private(set) var scanned = 0
     private(set) var currentPath = ""
     private(set) var unreadable = 0
+    private(set) var timedOut = 0
     /// Whether the results on screen came from a search that read inside files (contents or
     /// metadata), so they carry a snippet for the Match column.
     private(set) var searchedContents = false
@@ -254,23 +255,25 @@ final class SearchModel {
     /// refining them.
     @ObservationIgnored private var lastRun: Run?
     /// IDs already in `results`, so a hit carried over from the previous run is not added twice.
-    @ObservationIgnored private var knownIDs: Set<FileHit.ID> = []
+    @ObservationIgnored var knownIDs: Set<FileHit.ID> = []
     /// Rows kept from the previous run that this walk has not reported yet. Each still shows the
     /// size and dates of the last run: the fresh hit replaces it, and one never reported is dropped
     /// when the walk ends.
     @ObservationIgnored private var unconfirmed: Set<FileHit.ID> = []
-    /// Renames and moves made while this search's walk is still running, old path to new. The
-    /// walk's enumerator and buffers hold hits it found before the change landed; applied to each
-    /// incoming batch, those stragglers arrive under the paths the files have now instead of
-    /// becoming rows nothing on disk answers to.
-    @ObservationIgnored private var walkRelocations: [String: String] = [:]
+    /// Renames and moves made while this search's walk is still running, one old-path-to-new
+    /// dictionary per batch, in the order they happened. The walk's enumerator and buffers hold
+    /// hits it found before the change landed; run through the batches in turn, those stragglers
+    /// arrive under the paths the files have now instead of becoming rows nothing on disk answers
+    /// to. Kept apart rather than merged, because a later batch can rename inside an earlier
+    /// one's new path (A to B, then B/sub to B/sub2).
+    @ObservationIgnored var walkRelocations: [[String: String]] = []
     /// Paths trashed while this search's walk is still running; a straggler under one is dropped.
-    @ObservationIgnored private var walkTrashed: Set<String> = []
+    @ObservationIgnored var walkTrashed: Set<String> = []
 
     /// What decides whether the rows on screen would all be found again: the folders actually
     /// walked (so a different front Finder window or an ejected drive counts as a change), the
     /// options, and the limits from Settings.
-    private struct Run: Equatable {
+    struct Run: Equatable {
         let roots: [String]
         let options: SearchOptions
         let limits: SearchLimits
@@ -326,11 +329,11 @@ final class SearchModel {
         remember(query)
         scanned = 0
         unreadable = 0
+        timedOut = 0
         reachedLimit = false
         currentPath = ""
-        walkRelocations = [:]
+        walkRelocations = []
         walkTrashed = []
-        searchedLocation = location
         searchedContents = options.readsInsideFiles
         phase = .searching
 
@@ -354,7 +357,11 @@ final class SearchModel {
                 self.leaveDuplicates(restoring: false)
                 self.previewContext = options.readsInsideFiles
                     ? PreviewContext(
-                        matcher: request.textMatcher, recognizeText: options.searchContents && options.recognizeText,
+                        // Its own matcher: a regex guard gives up on a pattern for good, and the
+                        // search's state must neither silence the preview nor count its timeouts.
+                        matcher: (try? QueryMatcher(query: query, options: options, anchorsWildcards: false))
+                            ?? request.textMatcher,
+                        recognizeText: options.searchContents && options.recognizeText,
                         searchedMetadata: options.searchMetadata)
                     : nil
                 refine = self.refinable(for: request)
@@ -362,7 +369,8 @@ final class SearchModel {
             // Off the main actor: one existence check per row stalls the window on a network volume.
             // A row moved outside the roots since is not kept: the walk would never report it. The
             // roots as the walk reports them — a root under /var is walked as /private/var.
-            let (rows, roots, matcher) = (refine.rows, request.roots, request.nameMatcher)
+            let (rows, roots, matcher) = (refine.rows, request.roots,
+                (try? QueryMatcher(query: query, options: options, anchorsWildcards: true)) ?? request.nameMatcher)
             let kept = await Self.offMain {
                 let prefixes = roots.map(SearchEngine.walkedPath).map { $0.hasSuffix("/") ? $0 : $0 + "/" }
                 return rows.filter { hit in
@@ -372,7 +380,7 @@ final class SearchModel {
                 }
             }
             guard !Task.isCancelled else { return }
-            self?.adopt(kept, for: refine.run)
+            self?.adopt(kept, for: refine.run, at: location)
             for await event in SearchEngine.run(request) {
                 // Events already buffered when this search was stopped or replaced must not reach
                 // the next search's results.
@@ -402,12 +410,21 @@ final class SearchModel {
     /// Starts the new run's rows from those kept. `lastRun` changes only here, together with the
     /// rows, so a search cancelled before this point cannot leave one run's rows filed under
     /// another. Sorted, because rows kept from the duplicates view arrive in set order.
-    private func adopt(_ rows: [FileHit], for run: Run) {
+    /// The location is set here, with the rows, rather than when the search starts: stopped before
+    /// this point, the old rows are still on screen and must not be labelled with the new place.
+    /// The rows were checked off the main actor, so the user may have renamed, moved or trashed
+    /// some since `walkRelocations` and `walkTrashed` were reset; those changes are applied here,
+    /// or the snapshot would overwrite them.
+    func adopt(_ rows: [FileHit], for run: Run, at location: SearchLocation) {
         lastRun = run
-        results = rows
+        searchedLocation = location
+        var seen: Set<FileHit.ID> = []
+        results = settled(rows).filter { seen.insert($0.id).inserted }
         resort()
         knownIDs = Set(results.map(\.id))
-        unconfirmed = knownIDs
+        // A row the user moved in that window is current, as in `relocateRows`: the walk may have
+        // passed its new place already.
+        unconfirmed = knownIDs.intersection(rows.map(\.id))
         selection.formIntersection(knownIDs)
     }
 
@@ -495,14 +512,7 @@ final class SearchModel {
     /// is found by binary search: comparing it against every row on screen instead fell behind the
     /// walk at around 200,000 results.
     private func insertSorted(_ hits: [FileHit]) {
-        var hits = hits
-        // Stragglers from before a rename, move or trash landed mid-walk (see `walkRelocations`).
-        if !walkTrashed.isEmpty {
-            hits.removeAll { Self.isUnder($0.url.path, walkTrashed) }
-        }
-        if !walkRelocations.isEmpty {
-            hits = Self.relocate(hits, walkRelocations)
-        }
+        let hits = settled(hits)
         if !unconfirmed.isEmpty {
             // A kept row makes way for its fresh hit, which is merged in below like any other.
             var refreshed: Set<FileHit.ID> = []
@@ -531,6 +541,35 @@ final class SearchModel {
         results = merged
     }
 
+    /// Hits brought up to date with the renames, moves and trashes made since the walk began (see
+    /// `walkRelocations`): a straggler follows the renames in order and is dropped when it ends up
+    /// under a trashed path. Applied only to a hit nothing on disk answers to. The walk also
+    /// reports what it finds after a change, and a path can by then belong to a different file —
+    /// "Draft 2" after a renumbering, a new Report.pdf where the old one was trashed — which must
+    /// neither be sent on to the old file's new place nor dropped with it. A case-only rename is
+    /// the exception: the old spelling still "exists" on a case-insensitive volume.
+    private func settled(_ hits: [FileHit]) -> [FileHit] {
+        guard !walkRelocations.isEmpty || !walkTrashed.isEmpty else { return hits }
+        return hits.compactMap { hit in
+            let path = hit.url.path
+            let current = walkRelocations.reduce(path) { Self.relocatedPath($0, $1) ?? $0 }
+            guard current != path || Self.isUnder(path, walkTrashed) else { return hit }
+            let caseOnly = current != path && current.lowercased() == path.lowercased()
+            if !caseOnly, Self.exists(path) { return hit }
+            if Self.isUnder(current, walkTrashed) { return nil }
+            return current == path ? hit : Self.relocate([hit], [path: current])[0]
+        }
+    }
+
+    /// Whether anything is at `path`, a symbolic link counting as itself: `fileExists` follows it,
+    /// so a dangling link reads as nothing there.
+    nonisolated private static func exists(_ path: String) -> Bool {
+        var info = stat()
+        return lstat(path, &info) == 0
+    }
+
+    private static let nameOrder = KeyPathComparator(\FileHit.name)
+
     private func precedes(_ a: FileHit, _ b: FileHit) -> Bool {
         for comparator in sortOrder {
             switch comparator.compare(a, b) {
@@ -539,16 +578,22 @@ final class SearchModel {
             case .orderedSame: continue
             }
         }
+        // Sorted by Match, a name-only search ties on every row: no snippets, and no Match column to
+        // show the sort or change it. Name keeps such a list in a stable order.
+        if sortOrder.first?.keyPath == \FileHit.snippetText as AnyKeyPath {
+            return Self.nameOrder.compare(a, b) == .orderedAscending
+        }
         return false
     }
 
-    private func apply(_ event: SearchEvent) {
+    func apply(_ event: SearchEvent) {
         switch event {
         case .hits(let hits):
             insertSorted(hits)
-        case .progress(let scanned, let current, let unreadable):
+        case .progress(let scanned, let current, let unreadable, let timedOut):
             self.scanned = scanned
             self.unreadable = unreadable
+            self.timedOut = timedOut
             currentPath = current
         case .limitReached:
             reachedLimit = true
@@ -794,15 +839,18 @@ final class SearchModel {
         // Only files on disk: a file inside an archive cannot be trashed on its own, and trashing
         // the archive because one entry was selected would take everything else in it too.
         var seen = Set<URL>()
-        var urls = hits(ids).filter { !$0.isArchiveEntry }.map(\.url).filter { seen.insert($0).inserted }
+        let selected = hits(ids).filter { !$0.isArchiveEntry }.map(\.url).filter { seen.insert($0).inserted }
         // A folder trashed takes its contents with it, so a selected item inside a selected
         // folder (⌘A does this) is covered by the folder and dropped here, as Finder drops it.
-        urls = Self.withoutNestedSources(urls)
+        var urls = Self.withoutNestedSources(selected)
         guard !urls.isEmpty else {
             NSSound.beep()
             return
         }
         if settings.confirmTrash {
+            // Not under XCTest, as with "No duplicates": the panel really displays and the suite
+            // sits behind it.
+            guard !Self.isRunningTests else { return }
             let alert = NSAlert()
             alert.messageText = "Move \(Self.describe(urls)) to the Trash?"
             alert.informativeText = "You can put it back from the Trash in Finder."
@@ -812,7 +860,17 @@ final class SearchModel {
         }
         Self.batchesInFlight += 1
         defer { Self.batchesInFlight -= 1 }
-        let outcome = await Self.recycle(urls)
+        var outcome = await Self.recycle(urls)
+        // An item dropped as covered by its folder is not covered when the folder was refused
+        // (locked, protected): it gets its own attempt.
+        let covered = Self.coveredByRefused(selected, refused: urls.filter { !outcome.trashed.contains($0) })
+        if !covered.isEmpty {
+            let second = await Self.recycle(covered)
+            outcome.trashed.formUnion(second.trashed)
+            outcome.failed += second.failed
+            outcome.deniedByPermissions = outcome.deniedByPermissions || second.deniedByPermissions
+            urls += covered
+        }
         // Rows inside a trashed folder go with it, found by walking each row's path up, as
         // `relocate` does: one set lookup per level rather than a prefix test per trashed item.
         // An archive entry's row carries the archive's path, so a trashed zip takes its entries.
@@ -833,6 +891,7 @@ final class SearchModel {
         if outcome.deniedByPermissions, !Self.hasFullDiskAccess() {
             explainPermission(toDo: "delete", refused, failures: outcome.failed)
         } else {
+            guard !Self.isRunningTests else { return }
             let alert = NSAlert()
             alert.messageText = "Couldn’t move \(Self.describe(refused)) to the Trash"
             alert.informativeText = outcome.failed.joined(separator: "\n")
@@ -901,6 +960,7 @@ final class SearchModel {
     /// actually off — the callers check — since a plain POSIX refusal (a read-only folder, a
     /// root-owned one) arrives as the same error and no amount of access fixes it.
     private func explainPermission(toDo verb: String, _ urls: [URL], failures: [String]) {
+        guard !Self.isRunningTests else { return }
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "FinderPlus needs Full Disk Access to \(verb) \(Self.describe(urls))"
@@ -1069,8 +1129,11 @@ final class SearchModel {
         if outcome.deniedByPermissions, !Self.hasFullDiskAccess() {
             explainPermission(toDo: kind.verb, refused, failures: outcome.failed)
         } else {
+            guard !Self.isRunningTests else { return }
             let alert = NSAlert()
-            alert.messageText = "Couldn’t \(kind.verb) \(Self.describe(refused))"
+            alert.messageText = refused.isEmpty
+                ? "Moved, but the originals couldn’t be fully removed"
+                : "Couldn’t \(kind.verb) \(Self.describe(refused))"
             alert.informativeText = outcome.failed.joined(separator: "\n")
             alert.runModal()
         }
@@ -1101,25 +1164,59 @@ final class SearchModel {
             let target = availableName(
                 for: source.lastPathComponent, in: folder,
                 isFolder: values?.isDirectory == true && values?.isPackage != true)
+            // Across volumes `moveItem` copies and then deletes, and when the delete fails halfway
+            // it throws with the copy complete and the source half gone: the move looked like it
+            // never happened, the alert blamed the destination, and a retry made "Album 2". Done
+            // here instead, the two steps can be told apart.
+            let copies = kind == .copy || !sameVolume(source, folder)
             do {
-                switch kind {
-                case .copy: try FileManager.default.copyItem(at: source, to: target)
-                case .move: try FileManager.default.moveItem(at: source, to: target)
+                if copies {
+                    try FileManager.default.copyItem(at: source, to: target)
+                } else {
+                    try FileManager.default.moveItem(at: source, to: target)
                 }
-                outcome.done[source] = target
             } catch {
                 // `copyItem` stops at its first unreadable file and keeps what it copied; swept
                 // up, a retry starts clean instead of landing beside the remnant as "Album 2".
-                // `availableName` says the target did not exist before, so only ours is removed.
-                if kind == .copy { try? FileManager.default.removeItem(at: target) }
+                // `availableName` says the target did not exist before, so only ours is removed —
+                // and never after "already exists", where the item in the way is not ours.
+                if copies, !isAlreadyExists(error) { try? FileManager.default.removeItem(at: target) }
                 // A lock on the source refuses a move, but copying a locked file is fine, so a
                 // copy's failure must not be blamed on the lock.
-                let refusal = failure(error, of: source, lockMatters: kind == .move)
+                let refusal = failure(error, of: source, lockMatters: !copies)
                 outcome.failed.append(refusal.line)
                 if refusal.needsAccess { outcome.deniedByPermissions = true }
+                continue
+            }
+            outcome.done[source] = target
+            guard kind == .move, copies else { continue }
+            do {
+                try FileManager.default.removeItem(at: source)
+            } catch {
+                // The copy is whole, so the rows follow it. Full Disk Access is not offered: the
+                // original is partly gone, and another go at the move would copy it again.
+                outcome.failed.append(
+                    "\(source.lastPathComponent): Copied to “\(folder.lastPathComponent)”, but the original "
+                        + "couldn’t be fully removed. \(error.localizedDescription)")
             }
         }
         return outcome
+    }
+
+    /// Whether the two paths are on one volume, where a move is a rename. Anything that can't be
+    /// told is taken as yes, and left to `moveItem` to report.
+    nonisolated private static func sameVolume(_ source: URL, _ folder: URL) -> Bool {
+        var from = stat(), to = stat()
+        guard lstat(source.path, &from) == 0, stat(folder.path, &to) == 0 else { return true }
+        return from.st_dev == to.st_dev
+    }
+
+    nonisolated static func isAlreadyExists(_ error: any Error) -> Bool {
+        let error = error as NSError
+        let cocoa = error.domain == NSCocoaErrorDomain && error.code == NSFileWriteFileExistsError
+        let posix = error.domain == NSPOSIXErrorDomain && error.code == Int(EEXIST)
+        let underlying = (error.userInfo[NSUnderlyingErrorKey] as? NSError).map(isAlreadyExists) ?? false
+        return cocoa || posix || underlying
     }
 
     /// "Report.pdf", then "Report 2.pdf", "Report 3.pdf" — Finder's convention. A folder's name
@@ -1129,7 +1226,7 @@ final class SearchModel {
         let ext = isFolder ? "" : (name as NSString).pathExtension
         var candidate = folder.appending(path: name)
         var number = 2
-        while FileManager.default.fileExists(atPath: candidate.path) {
+        while exists(candidate.path) {
             candidate = folder.appending(path: ext.isEmpty ? "\(base) \(number)" : "\(base) \(number).\(ext)")
             number += 1
         }
@@ -1154,20 +1251,27 @@ final class SearchModel {
 
     /// Renames files in place, then updates their rows — selection included, so the renamed files
     /// stay selected under their new IDs.
-    func rename(_ steps: [RenameStep]) async {
+    func rename(_ steps: [RenameStep], token: String = UUID().uuidString) async {
         guard !steps.isEmpty else { return }
         Self.batchesInFlight += 1
         defer { Self.batchesInFlight -= 1 }
-        let outcome = await Task.detached { Self.performRename(steps) }.value
-        if !outcome.done.isEmpty {
-            relocateRows(after: outcome)
+        let outcome = await Task.detached { Self.performRename(steps, token: token) }.value
+        // A running walk can list a file while it is parked: with hidden files on, as a row under
+        // the holding name that is gone a moment later. Those hits are sent to where the file ended
+        // up, with the rest of the rename.
+        var ended = outcome
+        for (index, step) in steps.enumerated() {
+            let holding = Self.holdingURL(for: step, token: token, index: index)
+            ended.done[holding] = outcome.done[step.source] ?? step.source
         }
+        relocateRows(after: ended)
         guard !outcome.failed.isEmpty else { return }
         // Where each file is now: the batch is undone, bar any file the alert says ended elsewhere.
         let items = steps.map { outcome.done[$0.source] ?? $0.source }
         if outcome.deniedByPermissions, !Self.hasFullDiskAccess() {
             explainPermission(toDo: "rename", items, failures: outcome.failed)
         } else {
+            guard !Self.isRunningTests else { return }
             let alert = NSAlert()
             alert.messageText = "Couldn’t rename \(Self.describe(items))"
             alert.informativeText = outcome.failed.joined(separator: "\n")
@@ -1185,6 +1289,9 @@ final class SearchModel {
         results = Self.relocate(results, renamed)
         let newIDs = Dictionary(zip(before.map(\.id), results.map(\.id))) { first, _ in first }
         selection = Set(selection.map { newIDs[$0] ?? $0 })
+        // Two rows can land on one path: a file listed under both its holding name and its own.
+        var seen: Set<FileHit.ID> = []
+        results.removeAll { !seen.insert($0.id).inserted }
         knownIDs = Set(results.map(\.id))
         // A kept row the user just renamed or moved is current: a Find again walk that already
         // passed its new place won't report it, and must not drop it for that.
@@ -1223,17 +1330,10 @@ final class SearchModel {
         }
     }
 
-    /// Folds a batch of renames into `walkRelocations` while a walk is running, keeping chains
-    /// collapsed: renamed A to B and then B to C mid-walk, a straggler found under A must land
-    /// under C in one step.
+    /// Adds a batch of renames to `walkRelocations` while a walk is running.
     private func recordWalkRelocations(_ renamed: [String: String]) {
-        guard isSearching else { return }
-        for (old, current) in walkRelocations {
-            walkRelocations[old] = Self.relocatedPath(current, renamed) ?? current
-        }
-        for (old, new) in renamed where walkRelocations[old] == nil {
-            walkRelocations[old] = new
-        }
+        guard isSearching, !renamed.isEmpty else { return }
+        walkRelocations.append(renamed)
     }
 
     /// `path` after the renames in `renamed` — its own, or a renamed ancestor's rewritten part —
@@ -1270,12 +1370,28 @@ final class SearchModel {
         return sources.filter { !isUnder(($0.path as NSString).deletingLastPathComponent, paths) }
     }
 
+    /// The sources `withoutNestedSources` dropped because a folder among them covered them, for the
+    /// folders that turned out refused: nothing carried those, so each still has to be tried.
+    static func coveredByRefused(_ sources: [URL], refused: [URL]) -> [URL] {
+        let folders = Set(refused.map(\.path))
+        let dropped = sources.filter { source in
+            isUnder((source.path as NSString).deletingLastPathComponent, folders)
+        }
+        return withoutNestedSources(dropped)
+    }
+
+    nonisolated private static func holdingURL(for step: RenameStep, token: String, index: Int) -> URL {
+        step.source.deletingLastPathComponent().appending(path: ".FinderPlus-rename-\(token)-\(index)")
+    }
+
     /// Every file is parked under a temporary name before any lands under its new one, so a batch
     /// that permutes names — renumbering 1, 2, 3 the other way round — never collides with a file
     /// later in the same batch. All or nothing: the first failure undoes every step in reverse,
     /// because by then an earlier step may hold the failed file's old name, and half a
     /// renumbering is worse than none. `done` says where each file ended up.
-    nonisolated static func performRename(_ steps: [RenameStep]) -> TransferOutcome {
+    nonisolated static func performRename(
+        _ steps: [RenameStep], token: String = UUID().uuidString
+    ) -> TransferOutcome {
         let manager = FileManager.default
         var parked: [(holding: URL, step: RenameStep)] = []
         var landed = 0
@@ -1288,9 +1404,8 @@ final class SearchModel {
             let refusal = failure(error, of: item, named: name)
             return (refusal.line.replacingOccurrences(of: holding.lastPathComponent, with: name), refusal.needsAccess)
         }
-        for step in steps {
-            let holding = step.source.deletingLastPathComponent()
-                .appending(path: ".FinderPlus-rename-" + UUID().uuidString)
+        for (index, step) in steps.enumerated() {
+            let holding = holdingURL(for: step, token: token, index: index)
             do {
                 try manager.moveItem(at: step.source, to: holding)
                 parked.append((holding, step))

@@ -14,9 +14,18 @@ on:
         description: 'Existing tag to release (e.g. v1.2.0)'
         required: true
 
-# No concurrency group: GitHub keeps one pending run per group and cancels the rest, so pushing
-# several tags at once would drop releases. Instead the feed step below regenerates against the
-# latest feed and retries when another release pushed first.
+# One run per commit at a time. Two tags on one commit share a build number, the commit count:
+# side by side, both zips carried it and the second to reach the feed was refused after its GitHub
+# release was already public. Queued, the second starts once the first is in the feed, and
+# release.sh raises it to the next free build. Keyed by commit rather than one group for every
+# release: GitHub keeps one pending run per group and cancels the rest, so a single group would
+# drop releases whenever several tags went up at once. Releases of different commits still run
+# side by side, and the feed step below regenerates against the latest feed and retries when
+# another release pushed first. A manual re-run is keyed by the default branch's head, the same
+# commit when the tag is on it.
+concurrency:
+  group: release-${{ github.sha }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -70,12 +79,33 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
           VERSION: ${{ steps.version.outputs.version }}
+          BUILD: ${{ steps.version.outputs.build }}
         run: |
           set -euo pipefail
           ASSET_NAME="FinderPlus-$VERSION.zip"
           # Listed first, so a failed query stops the job rather than reading as "no release".
           TAGS="$(gh release list --limit 1000 --json tagName --jq '.[].tagName')"
           if ! grep -Fx -- "$TAG" <<<"$TAGS" >/dev/null; then
+            # Queued behind any other run on this commit, this one finds each other tag here
+            # finished or not yet started — or failed after its GitHub release went up and before
+            # its feed entry. That one's re-run reuses its zip, whose build number this release
+            # would take first and leave it unfixable, so it has to finish first.
+            for SIBLING in $(git tag --points-at HEAD --list 'v*'); do
+              [[ "$SIBLING" != "$TAG" && "$SIBLING" =~ ^v[0-9]+(\.[0-9]+)*(-[0-9A-Za-z.]+)?$ ]] || continue
+              grep -Fx -- "$SIBLING" <<<"$TAGS" >/dev/null || continue
+              FEED=""
+              if git fetch --quiet origin gh-pages; then
+                FEED="$(git show FETCH_HEAD:appcast.xml 2>/dev/null || true)"
+              fi
+              IN_FEED=0
+              if [[ -n "$FEED" ]]; then
+                IN_FEED="$(xmllint --xpath "count(/rss/channel/item[title = \"${SIBLING#v}\"])" - <<<"$FEED")"
+              fi
+              if [[ "$IN_FEED" == 0 ]]; then
+                echo "::error::$SIBLING is on this same commit and released, but not in the update feed. Re-run its release first (Actions > Release > Run workflow, tag $SIBLING), then this one: its zip carries build $BUILD, which this release would otherwise take first."
+                exit 1
+              fi
+            done
             echo "exists=0" >> "$GITHUB_OUTPUT"
             echo "reuse=0" >> "$GITHUB_OUTPUT"
             exit 0

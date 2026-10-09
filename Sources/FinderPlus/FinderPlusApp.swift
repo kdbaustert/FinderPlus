@@ -69,7 +69,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The model of the active window. Folders and searches that arrive before a window exists
     /// wait in the `pending` fields below.
     var model: SearchModel? {
-        didSet { deliverPending() }
+        didSet {
+            if model != nil { closedWithBatchRunning = false }
+            deliverPending()
+        }
     }
 
     /// Set by the first window; called to open another when a search arrives after every search
@@ -82,8 +85,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Not while a batch runs, or closing the last window would quit without waiting for it.
     /// AppKit asks only at that moment, so `batchesDrained` finishes the quit later.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        SearchModel.batchesInFlight == 0
+        guard SearchModel.batchesInFlight == 0 else {
+            closedWithBatchRunning = true
+            return false
+        }
+        return true
     }
+
+    /// Set when the last window was closed during a batch, so `batchesDrained` knows the quit was
+    /// only postponed. Without it, a window that is merely minimized or hidden (neither counts as
+    /// visible) would look closed, and the app would quit under the user when the batch finished.
+    private var closedWithBatchRunning = false
 
     /// Quitting waits for renames, moves and trashes in flight rather than killing them: a rename
     /// stopped mid-batch leaves files under hidden holding names.
@@ -103,7 +115,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if waitingToTerminate {
             waitingToTerminate = false
             NSApp.reply(toApplicationShouldTerminate: true)
-        } else if !NSApp.windows.contains(where: { $0.isVisible && $0.canBecomeKey }) {
+        } else if closedWithBatchRunning
+            && !NSApp.windows.contains(where: { ($0.isVisible || $0.isMiniaturized) && $0.canBecomeKey })
+        {
             NSApp.terminate(nil)
         }
     }
@@ -230,6 +244,8 @@ struct SearchCommands: Commands {
                     .keyboardShortcut("f")
                 Button("Choose Location…") { model.choosingFolder = true }
                     .keyboardShortcut("l")
+                    // The folder picker can't open over a sheet, and its flag would stay set.
+                    .disabled(model.showsFullDiskAccessPrompt || model.renameRequest != nil)
                 Button("Start Search") { model.start() }
                     .keyboardShortcut(.return)
                 Button("Stop Search") { model.stop() }

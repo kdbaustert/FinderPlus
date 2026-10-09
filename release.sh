@@ -12,9 +12,11 @@
 # so it must be a whole number that grows with every release, betas and stable alike (the workflow
 # uses the commit count). A BUILD the feed already carries — the same commit released again, as
 # when a beta is promoted to stable — is raised to the next free one: two releases with the same
-# build would share, and garble, one feed entry. A BUILD not above its own channel's newest is
-# refused instead, since no copy would be offered it — and raising it past every channel would
-# offer a stable hotfix to beta copies as an "update" that is really a downgrade.
+# build would share, and garble, one feed entry. That raise happens only when the entry is the
+# feed's newest; promoting an older commit while newer builds are live is refused, since the raised
+# build would sit above them and offer their users older code. A BUILD not above its own channel's
+# newest is refused instead, since no copy would be offered it — and raising it past every channel
+# would offer a stable hotfix to beta copies as an "update" that is really a downgrade.
 #
 # The workflow signs with its signing identity when it has one and ad-hoc when it doesn't; a hand
 # run signs as "FinderPlus Local" when that certificate is in the keychain (see build.sh's
@@ -125,7 +127,16 @@ if [[ -f "$STAGING/appcast.xml" ]]; then
         [[ "$(feed_value "count($ITEM)")" != 0 ]] && ENTRY_EXISTS=1
     elif [[ "$(feed_value "count($ITEM)")" != 0 ]]; then
         # The same commit released again — a beta promoted to stable keeps its commit count — takes
-        # the next free build rather than garbling the entry already published under this one.
+        # the next free build rather than garbling the entry already published under this one. Only
+        # when that entry is the feed's newest, though: with a newer one live (an older beta's
+        # commit promoted after a later beta shipped), the raised build would sit above it and
+        # offer beta copies older code as an "update".
+        if (( BUILD != LATEST )); then
+            echo "==> ERROR: the feed already has an entry for build $BUILD, and newer ones (up to build $LATEST) are live" >&2
+            echo "    Raising this release past them would offer older code to copies already on the newer builds" >&2
+            echo "    Tag a commit newer than the one that made build $LATEST, or set BUILD above $LATEST yourself" >&2
+            exit 1
+        fi
         echo "==> NOTE: the feed already has an entry for build $BUILD; releasing as build $((LATEST + 1))"
         BUILD=$((LATEST + 1))
         ITEM="/rss/channel/item[$(sparkle version) = \"$BUILD\"]"

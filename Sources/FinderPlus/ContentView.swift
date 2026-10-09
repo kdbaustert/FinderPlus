@@ -62,6 +62,12 @@ struct ContentView: View {
         .fileImporter(isPresented: Bindable(model).choosingFolder, allowedContentTypes: [.folder]) { result in
             if case .success(let url) = result { model.addFolders([url]) }
         }
+        // A sheet can still arrive while the picker is up (the Full Disk Access check runs when the
+        // app is activated). The picker then never presents, and the flag left set would make ⌘L
+        // do nothing for good and keep Move to Trash disabled.
+        .onChange(of: model.showsFullDiskAccessPrompt || model.renameRequest != nil) { _, sheetUp in
+            if sheetUp { model.choosingFolder = false }
+        }
         .task { model.checkFullDiskAccessAtLaunch() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             model.recheckFullDiskAccess()
@@ -270,7 +276,8 @@ struct RecentsMenu: View {
 // MARK: - Options panel
 
 /// EasyFind's options column — Location, Search for, Operator, Comparison, Include — rebuilt as
-/// grouped cards on a glass panel. Every change re-runs a search already on screen.
+/// grouped cards on a glass panel. A change applies to the next search; one already on screen is
+/// left as it is.
 struct OptionsPanel: View {
     @Environment(SearchModel.self) private var model
 
@@ -422,6 +429,7 @@ struct LocationMenu: View {
         Menu {
             Button("Select…") { model.choosingFolder = true }
                 .keyboardShortcut("l")
+                .disabled(model.showsFullDiskAccessPrompt || model.renameRequest != nil)
             Divider()
             choices([.activeFinderWindow])
             Divider()
@@ -527,7 +535,25 @@ struct ResultsView: View {
                 PreviewPane()
             }
         }
-        .quickLookPreview($model.previewURL, in: model.selectedURLs)
+        // SwiftUI's Quick Look traps when the list is empty while the binding is set, and rewrites
+        // the binding to the list's first item, so the list must always hold `previewURL`.
+        .quickLookPreview($model.previewURL, in: previewItems)
+        // Keyed on the selection, not its URLs: those scan every result, on each redraw of a
+        // search still streaming in.
+        .onChange(of: model.selection) {
+            guard let url = model.previewURL else { return }
+            let urls = model.selectedURLs
+            // Follows the selection while the panel is open, and closes with nothing left to show.
+            if !urls.contains(url) { model.previewURL = urls.first }
+        }
+    }
+
+    /// The selection, or just the previewed row when the context menu opened Quick Look on a row
+    /// outside it.
+    private var previewItems: [URL] {
+        let urls = model.selectedURLs
+        guard let url = model.previewURL, !urls.contains(url) else { return urls }
+        return [url]
     }
 
     private var table: some View {
@@ -761,6 +787,11 @@ struct StatusPill: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(.orange)
                 .help("Some folders could not be read. Grant Full Disk Access to search them.")
+            }
+            if model.timedOut > 0 {
+                Label("\(model.timedOut) timed out", systemImage: "clock.badge.exclamationmark")
+                    .foregroundStyle(.orange)
+                    .help("The regular expression took too long on these files, so they were skipped. Try a simpler pattern.")
             }
         }
         .font(.callout)

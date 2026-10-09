@@ -92,7 +92,8 @@ private struct MatchesPreview: View {
                     return (text, context.matcher.ranges(in: text))
                 }
                 let contents = marked(SearchEngine.contentText(
-                    of: url, size: size, maxBytes: maxBytes, recognizeText: context.recognizeText))
+                    of: url, size: size, maxBytes: maxBytes, recognizeText: context.recognizeText,
+                    capsExtractions: false))
                 if let contents, !contents.ranges.isEmpty { return contents }
                 // A file found by its metadata — owner, permissions — shows that, rather than a body
                 // with nothing marked in it. Not when metadata wasn't searched: the match is then

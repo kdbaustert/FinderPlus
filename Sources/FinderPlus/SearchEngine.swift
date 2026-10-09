@@ -65,7 +65,8 @@ struct FileHit: Identifiable, Hashable, Sendable {
 
 enum SearchEvent: Sendable {
     case hits([FileHit])
-    case progress(scanned: Int, current: String, unreadable: Int)
+    /// `timedOut`: texts a regular expression gave up on, so the results may be missing files.
+    case progress(scanned: Int, current: String, unreadable: Int, timedOut: Int)
     /// The match limit from Settings was reached and the walk stopped early.
     case limitReached
 }
@@ -89,15 +90,18 @@ struct SearchRequest: Sendable {
     let options: SearchOptions
     let limits: SearchLimits
 
-    init(roots: [URL], query: String, options: SearchOptions, limits: SearchLimits = SearchLimits()) throws {
+    init(
+        roots: [URL], query: String, options: SearchOptions, limits: SearchLimits = SearchLimits(),
+        matchBudget: Duration = .seconds(2)
+    ) throws {
         self.roots = roots
         self.options = options
         self.limits = SearchLimits(
             maxContentBytes: limits.maxContentBytes,
             maxResults: limits.maxResults,
             skippedFolderNames: Set(limits.skippedFolderNames.map { $0.lowercased() }))
-        nameMatcher = try QueryMatcher(query: query, options: options, anchorsWildcards: true)
-        textMatcher = try QueryMatcher(query: query, options: options, anchorsWildcards: false)
+        nameMatcher = try QueryMatcher(query: query, options: options, anchorsWildcards: true, timeBudget: matchBudget)
+        textMatcher = try QueryMatcher(query: query, options: options, anchorsWildcards: false, timeBudget: matchBudget)
     }
 }
 
@@ -106,8 +110,9 @@ struct SearchRequest: Sendable {
 enum SearchEngine {
 
     /// TypeScript's extensions, which macOS maps to MPEG-2 types: `.ts` a transport stream,
-    /// `.mts` and `.cts` AVCHD. Either meaning can be true of any one file, so these are kept
-    /// out of kind exclusion and shown under a neutral kind.
+    /// `.mts` and `.cts` AVCHD. Either meaning can be true of any one file, so these are shown
+    /// under a neutral kind, and kept out of kind exclusion unless the content is a transport
+    /// stream (see `isMPEGTransportStream`).
     private static let mpeg2SourceExtensions: Set<String> = ["ts", "mts", "cts"]
 
     private static let resourceKeys: Set<URLResourceKey> = [
@@ -185,7 +190,9 @@ enum SearchEngine {
                 emit(.hits(pending))
                 pending.removeAll(keepingCapacity: true)
             }
-            emit(.progress(scanned: scanned, current: current, unreadable: unreadable.withLock { $0 }))
+            emit(.progress(
+                scanned: scanned, current: current, unreadable: unreadable.withLock { $0 },
+                timedOut: request.nameMatcher.timeouts + request.textMatcher.timeouts))
         }
 
         func searchCandidateContents() {
@@ -209,7 +216,7 @@ enum SearchEngine {
                 {
                     snippet = request.textMatcher.snippet(in: text)
                 }
-                guard let snippet else { return }
+                guard let snippet, !isHiddenVideo(hit.url, isRegularFile: hit.size >= 0) else { return }
                 hit.snippet = snippet
                 let matched = hit
                 found.withLock { $0.append(matched) }
@@ -220,13 +227,23 @@ enum SearchEngine {
         func isExcludedKind(_ ext: String) -> Bool {
             guard !options.excludedKinds.isEmpty, !ext.isEmpty else { return false }
             // TypeScript before the type lookup: these extensions declare MPEG-2 video types, and
-            // a "Video" exclusion was hiding source files from name searches too.
+            // a "Video" exclusion was hiding source files from name searches too. A camcorder's
+            // .MTS clip is the other meaning of the extension; see `isHiddenVideo`.
             if mpeg2SourceExtensions.contains(ext) { return false }
             if let cached = excludedExtensions[ext] { return cached }
             let type = UTType(filenameExtension: ext)
             let excluded = type.map { type in options.excludedKinds.contains { type.conforms(to: $0.type) } } ?? false
             excludedExtensions[ext] = excluded
             return excluded
+        }
+
+        /// A camcorder's .MTS clip under a Video exclusion, told apart from TypeScript by what the
+        /// file holds. Asked only of a file that already matched, and only of a regular file:
+        /// every .ts under node_modules would otherwise be opened, and a FIFO would block the walk.
+        @Sendable func isHiddenVideo(_ url: URL, isRegularFile: Bool) -> Bool {
+            isRegularFile && options.excludedKinds.contains(.video)
+                && mpeg2SourceExtensions.contains(url.pathExtension.lowercased())
+                && !isPlaceholder(url) && isMPEGTransportStream(url)
         }
 
         /// Lists a zip's entries by name. Their sizes are unknown, so a size filter leaves them out;
@@ -355,7 +372,7 @@ enum SearchEngine {
                             || (options.searchTags && (values.tagNames ?? []).contains(where: request.nameMatcher.matches))
                             || (options.searchComments && finderComment(of: url).map(request.textMatcher.matches) == true)
                         {
-                            pending.append(makeHit())
+                            if !isHiddenVideo(url, isRegularFile: isRegularFile) { pending.append(makeHit()) }
                         } else if options.readsInsideFiles && isRegularFile {
                             candidates.append(makeHit())
                             if candidates.count >= 64 { searchCandidateContents() }
@@ -389,6 +406,19 @@ enum SearchEngine {
     static func walkedPath(of root: URL) -> String {
         let root = root.resolvingSymlinksInPath()
         return (try? root.resourceValues(forKeys: [.canonicalPathKey]).canonicalPath) ?? root.path
+    }
+
+    /// Whether a file is an MPEG transport stream: a sync byte 0x47 at the start of each of its
+    /// first three packets, 188 bytes apart, or 192 apart with a 4-byte timestamp ahead of each
+    /// (the BDAV packets of AVCHD). One byte would be a TypeScript file starting with "G".
+    static func isMPEGTransportStream(_ url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        guard let head = try? handle.read(upToCount: 400) else { return false }
+        func syncs(at first: Int, every stride: Int) -> Bool {
+            (0..<3).allSatisfy { $0 * stride + first < head.count && head[head.startIndex + $0 * stride + first] == 0x47 }
+        }
+        return syncs(at: 0, every: 188) || syncs(at: 4, every: 192)
     }
 
     /// Folders pruned before the walk descends into them. `rootPath` is the resolved root being
@@ -470,7 +500,7 @@ enum SearchEngine {
     /// `Task.isCancelled` is always false.
     static func contentText(
         of url: URL, size: Int64, maxBytes: Int = SearchLimits().maxContentBytes, recognizeText: Bool = false,
-        isStopped: () -> Bool = { Task.isCancelled }, onUnreadable: () -> Void = {}
+        isStopped: () -> Bool = { Task.isCancelled }, onUnreadable: () -> Void = {}, capsExtractions: Bool = true
     ) -> String? {
         guard size > 0, size <= maxBytes, !isStopped() else { return nil }
         // An iCloud file that is not downloaded is a placeholder, and reading it downloads it — a
@@ -483,9 +513,13 @@ enum SearchEngine {
             return nil
         }
         let type = UTType(filenameExtension: url.pathExtension)
+        let ext = url.pathExtension.lowercased()
 
         if let type, type.conforms(to: .pdf) {
-            guard let document = PDFDocument(url: url) else { return nil }
+            guard let document = PDFDocument(url: url) else {
+                onUnreadable()
+                return nil
+            }
             let text = document.string ?? ""
             // Next to no text across the pages means a scan: pictures of pages, not text.
             if recognizeText, text.trimmingCharacters(in: .whitespacesAndNewlines).count < 20 * max(document.pageCount, 1) / 10 {
@@ -497,17 +531,27 @@ enum SearchEngine {
         if recognizeText, let type, type.conforms(to: .image), !type.conforms(to: .text) {
             return DocumentText.recognizedText(inImageAt: url, isStopped: isStopped)
         }
-        if let type, let format = richTextTypes.first(where: { type.conforms(to: $0.type) })?.format {
-            if let text = try? NSAttributedString(
-                url: url, options: [.documentType: format], documentAttributes: nil).string
-            {
-                return text
+        // Set once a word-processor parse has failed: only then can a ".doc" be HTML wearing the
+        // wrong name. Sniffed for every file it would send PHP views, templates and Markdown
+        // that open with `<!doctype html` through the tag stripper, which empties them.
+        var mayBeHTML = false
+        if let format = richTextTypes.first(where: { type?.conforms(to: $0.type) == true })?.format
+            ?? misnamedWordFormats[ext]
+        {
+            let parsed = DocumentText.withHeavySlot(isStopped: isStopped, capped: capsExtractions) {
+                wordProcessorText(at: url, format: format) ?? misnamedWordText(at: url, tried: format)
             }
+            if let parsed { return parsed }
+            if isStopped() { return nil }
             // A failed parse falls through to the sniff below: the usual culprit is HTML wearing
             // a ".doc" extension, which the sniff reads as the text it is.
+            mayBeHTML = true
         }
-        if let members = DocumentText.zipMembers(forExtension: url.pathExtension.lowercased()) {
-            return DocumentText.zipText(of: url, members: members, maxBytes: maxBytes, isStopped: isStopped)
+        if let members = DocumentText.zipMembers(forExtension: ext) {
+            return DocumentText.withHeavySlot(isStopped: isStopped, capped: capsExtractions) {
+                DocumentText.zipText(
+                    of: url, members: members, maxBytes: maxBytes, isStopped: isStopped, onUnreadable: onUnreadable)
+            }
         }
         // Every other file is sniffed, whatever its declared type: macOS files `.ts` as an MPEG-2
         // video stream, and `.plist`, `.eml` and `.pem` as types that are not text, though each is
@@ -516,18 +560,71 @@ enum SearchEngine {
         // A plain read: decoding copies the bytes anyway, and a mapped file whose volume goes
         // away mid-read takes the process down with SIGBUS. The first 8 KB alone decides a file is
         // binary, so only that much is read to turn one down, not the whole file.
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
+            // Readable by `access`, yet not openable: a privacy prompt (TCC) the user has not
+            // allowed answers EPERM only here.
+            onUnreadable()
+            return nil
+        }
         defer { try? handle.close() }
         guard let head = try? handle.read(upToCount: 8192), !isBinary(head),
               (try? handle.seek(toOffset: 0)) != nil,
               let data = try? handle.readToEnd(), let text = decode(data)
-        else { return nil }
-        // Web pages are searched for what they say, not for their tags and scripts. Checked by
-        // content as well as by type, for the HTML that reaches here under a ".doc" name.
-        if (type?.conforms(to: .html) ?? false) || looksLikeHTML(text) {
+        else {
+            // A word-processor file nothing could read: a password-protected one is an OLE
+            // container the readers refuse and the sniff takes for binary.
+            if mayBeHTML { onUnreadable() }
+            return nil
+        }
+        // Web pages are searched for what they say, not for their tags and scripts.
+        if (type?.conforms(to: .html) ?? false) || (mayBeHTML && looksLikeHTML(text)) {
             return DocumentText.markupText(text, isStopped: isStopped)
         }
         return text
+    }
+
+    /// Readers for the word-processor extensions that conform to none of `richTextTypes`:
+    /// macro-enabled and template variants, which AppKit reads as the format they extend.
+    private static let misnamedWordFormats: [String: NSAttributedString.DocumentType] = [
+        "docm": .officeOpenXML, "dotx": .officeOpenXML, "dotm": .officeOpenXML,
+        "dot": .docFormat, "ott": .openDocument,
+    ]
+
+    private static func wordProcessorText(at url: URL, format: NSAttributedString.DocumentType) -> String? {
+        try? NSAttributedString(url: url, options: [.documentType: format], documentAttributes: nil).string
+    }
+
+    /// Text from a word-processor file whose extension named the wrong format (`tried`), chosen
+    /// by what the file starts with: RTF saved as ".doc", a ".docx" that is a Word 97 file, an
+    /// OpenDocument text named ".doc", Word 2003 XML. The format is still passed, never sniffed,
+    /// so HTML does not reach WebKit (see `richTextTypes`).
+    private static func misnamedWordText(at url: URL, tried: NSAttributedString.DocumentType) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url), let head = try? handle.read(upToCount: 1024) else {
+            return nil
+        }
+        defer { try? handle.close() }
+        let formats: [NSAttributedString.DocumentType]
+        if head.starts(with: Array(#"{\rtf"#.utf8)) {
+            formats = [.rtf]
+        } else if head.starts(with: [0x50, 0x4B, 0x03, 0x04]) {
+            formats = [.officeOpenXML, .openDocument]
+        } else if head.starts(with: [0xD0, 0xCF, 0x11, 0xE0]) {
+            formats = [.docFormat]
+        } else if String(decoding: head, as: UTF8.self).contains("<?xml"),
+                  String(decoding: head, as: UTF8.self).contains("wordDocument")
+        {
+            // Word 2003 XML: the text is in the tags, so it reads as markup.
+            guard (try? handle.seek(toOffset: 0)) != nil, let data = try? handle.readToEnd(),
+                  let text = decode(data)
+            else { return nil }
+            return DocumentText.markupText(text)
+        } else {
+            return nil
+        }
+        for format in formats where format != tried {
+            if let text = wordProcessorText(at: url, format: format) { return text }
+        }
+        return nil
     }
 
     /// HTML by content, for a file whose extension says otherwise.
