@@ -3,6 +3,15 @@
     <channel>
         <title>FinderPlus</title>
         <item>
+            <title>1.1.1</title>
+            <pubDate>Fri, 09 Oct 2026 18:07:58 +0000</pubDate>
+            <sparkle:fullReleaseNotesLink>https://github.com/kdbaustert/FinderPlus/releases/tag/v1.1.1</sparkle:fullReleaseNotesLink>
+            <sparkle:version>24</sparkle:version>
+            <sparkle:shortVersionString>1.1.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/kdbaustert/FinderPlus/releases/download/v1.1.1/FinderPlus-1.1.1.zip" length="4191860" type="application/octet-stream" sparkle:edSignature="+TuwsxS//5iYxl5C27VYZM14Qbf8RAvizPrTvtOM+6G4E08FcukjApcV+f5PP0uqdTUOHgOeaon88IlMfok0Dw=="/>
+        </item>
+        <item>
             <title>1.1.0</title>
             <pubDate>Mon, 28 Sep 2026 09:37:12 +0000</pubDate>
             <sparkle:fullReleaseNotesLink>https://github.com/kdbaustert/FinderPlus/releases/tag/v1.1.0</sparkle:fullReleaseNotesLink>
